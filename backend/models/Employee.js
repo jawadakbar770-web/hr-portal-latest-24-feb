@@ -6,12 +6,14 @@ const employeeSchema = new mongoose.Schema({
     type: String,
     required: true,
     unique: true,
-    lowercase: true
+    lowercase: true,
+    index: true
   },
   employeeNumber: {
     type: String,
     required: true,
-    unique: true
+    unique: true,
+    index: true
   },
   firstName: {
     type: String,
@@ -23,7 +25,6 @@ const employeeSchema = new mongoose.Schema({
   },
   department: {
     type: String,
-    // Ensure 'Manager' is included so adminAuth middleware works
     enum: ['IT', 'Customer Support', 'Manager', 'Marketing', 'HR', 'Finance'],
     required: true
   },
@@ -31,48 +32,71 @@ const employeeSchema = new mongoose.Schema({
     type: Date,
     required: true
   },
-shift: {
+
+  // Shift Times (24-hour format HH:mm)
+  shift: {
     start: {
       type: String,
       required: true,
-      default: '09:00'
+      default: '09:00',
+      validate: {
+        validator: function(v) {
+          return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v);
+        },
+        message: 'Shift time must be in HH:mm format (24-hour)'
+      }
     },
     end: {
       type: String,
       required: true,
-      default: '18:00'
+      default: '18:00',
+      validate: {
+        validator: function(v) {
+          return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v);
+        },
+        message: 'Shift time must be in HH:mm format (24-hour)'
+      }
     }
-  }, // <--- Add this missing comma
+  },
+
   hourlyRate: {
     type: Number,
-    required: true
+    required: true,
+    min: 0
   },
+
   status: {
     type: String,
     enum: ['Active', 'Inactive', 'Frozen'],
     default: 'Inactive'
   },
+
   isArchived: {
     type: Boolean,
     default: false
   },
+
   password: String,
   tempPassword: String,
   inviteToken: String,
   inviteTokenExpires: Date,
+
   bank: {
     bankName: String,
     accountName: String,
     accountNumber: String
   },
+
   securityQuestions: [{
     question: String,
     answer: String
   }],
+
   isDeleted: {
     type: Boolean,
     default: false
   },
+
   createdAt: {
     type: Date,
     default: Date.now
@@ -100,7 +124,6 @@ employeeSchema.pre('save', async function(next) {
   next();
 });
 
-// Compare password method
 employeeSchema.methods.comparePassword = async function(enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };

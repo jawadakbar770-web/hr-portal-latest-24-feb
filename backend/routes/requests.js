@@ -6,7 +6,6 @@ const AttendanceLog = require('../models/AttendanceLog');
 const Employee = require('../models/Employee');
 const jwt = require('jsonwebtoken');
 
-// Middleware
 const auth = async (req, res, next) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
@@ -21,7 +20,6 @@ const auth = async (req, res, next) => {
   }
 };
 
-// Get leave balance for employee
 function getLeaveBalance(joiningDate) {
   const now = new Date();
   const joinDate = new Date(joiningDate);
@@ -32,12 +30,11 @@ function getLeaveBalance(joiningDate) {
   return { canApply, daysUntilEligible, holidayLeaves: 13, sickLeaves: 7 };
 }
 
-// Submit leave request
+// **Submit leave request**
 router.post('/leave/submit', auth, async (req, res) => {
   try {
     const { fromDate, toDate, leaveType, reason } = req.body;
     
-    // Check eligibility
     const { canApply, daysUntilEligible } = getLeaveBalance(req.user.joiningDate);
     if (!canApply) {
       return res.status(400).json({
@@ -46,7 +43,6 @@ router.post('/leave/submit', auth, async (req, res) => {
       });
     }
     
-    // Check for conflicts
     const existingRequest = await LeaveRequest.findOne({
       empId: req.user._id,
       status: 'Pending',
@@ -57,7 +53,7 @@ router.post('/leave/submit', auth, async (req, res) => {
     
     if (existingRequest) {
       return res.status(400).json({
-        message: 'You already have a pending leave request for this date. Wait for admin approval.'
+        message: 'You already have a pending leave request for this date range.'
       });
     }
     
@@ -83,12 +79,11 @@ router.post('/leave/submit', auth, async (req, res) => {
   }
 });
 
-// Submit correction request
+// **Submit correction request**
 router.post('/correction/submit', auth, async (req, res) => {
   try {
     const { date, fromTime, toTime, reason } = req.body;
     
-    // Check for conflicts
     const existingRequest = await CorrectionRequest.findOne({
       empId: req.user._id,
       date: new Date(date),
@@ -132,7 +127,7 @@ router.post('/correction/submit', auth, async (req, res) => {
   }
 });
 
-// Get employee requests
+// **Get employee requests**
 router.get('/my-requests', auth, async (req, res) => {
   try {
     const { fromDate, toDate, status, type } = req.query;
@@ -174,7 +169,7 @@ router.get('/my-requests', auth, async (req, res) => {
   }
 });
 
-// Admin: Get all pending requests
+// **Admin: Get all pending requests**
 router.get('/admin/pending', auth, async (req, res) => {
   try {
     if (req.role !== 'admin') {
@@ -205,7 +200,7 @@ router.get('/admin/pending', auth, async (req, res) => {
   }
 });
 
-// Admin: Approve leave request
+// **Admin: Approve leave request**
 router.patch('/leave/:requestId/approve', auth, async (req, res) => {
   try {
     if (req.role !== 'admin') {
@@ -230,8 +225,7 @@ router.patch('/leave/:requestId/approve', auth, async (req, res) => {
           date: new Date(dateStr)
         },
         {
-          status: 'Leave',
-          'financials.dailyEarning': calculateLeaveEarning(leaveRequest.empId)
+          status: 'Leave'
         },
         { upsert: true }
       );
@@ -244,7 +238,7 @@ router.patch('/leave/:requestId/approve', auth, async (req, res) => {
   }
 });
 
-// Admin: Reject leave request
+// **Admin: Reject leave request**
 router.patch('/leave/:requestId/reject', auth, async (req, res) => {
   try {
     if (req.role !== 'admin') {
@@ -265,7 +259,7 @@ router.patch('/leave/:requestId/reject', auth, async (req, res) => {
   }
 });
 
-// Admin: Approve correction request
+// **Admin: Approve correction request**
 router.patch('/correction/:requestId/approve', auth, async (req, res) => {
   try {
     if (req.role !== 'admin') {
@@ -281,25 +275,16 @@ router.patch('/correction/:requestId/approve', auth, async (req, res) => {
     await correctionRequest.save();
     
     // Update attendance record
-    const attendance = await AttendanceLog.findOneAndUpdate(
+    await AttendanceLog.findOneAndUpdate(
       {
         empId: correctionRequest.empId,
-        date: new Date(correctionRequest.date)
+        date: correctionRequest.date
       },
       {
         'inOut.in': correctionRequest.correctedInTime,
         'inOut.out': correctionRequest.correctedOutTime
-      },
-      { new: true }
+      }
     );
-
-    // Recalculate daily earning
-    if (attendance) {
-      const employee = await Employee.findById(correctionRequest.empId);
-      const hoursPerDay = calculateHours(correctionRequest.correctedInTime, correctionRequest.correctedOutTime);
-      attendance.financials.dailyEarning = (hoursPerDay * employee.hourlyRate) - (attendance.financials.deduction || 0);
-      await attendance.save();
-    }
     
     res.json({ message: 'Correction request approved', correctionRequest });
   } catch (error) {
@@ -307,7 +292,7 @@ router.patch('/correction/:requestId/approve', auth, async (req, res) => {
   }
 });
 
-// Admin: Reject correction request
+// **Admin: Reject correction request**
 router.patch('/correction/:requestId/reject', auth, async (req, res) => {
   try {
     if (req.role !== 'admin') {
@@ -327,25 +312,5 @@ router.patch('/correction/:requestId/reject', auth, async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 });
-
-function calculateHours(startTime, endTime) {
-  const [startHour, startMin] = startTime.split(':').map(Number);
-  const [endHour, endMin] = endTime.split(':').map(Number);
-  
-  let start = startHour * 60 + startMin;
-  let end = endHour * 60 + endMin;
-  
-  if (end < start) end += 24 * 60;
-  
-  return (end - start) / 60;
-}
-
-async function calculateLeaveEarning(empId) {
-  const employee = await Employee.findById(empId);
-  const [startHour, startMin] = employee.shift.start.split(':').map(Number);
-  const [endHour, endMin] = employee.shift.end.split(':').map(Number);
-  const hoursPerDay = ((endHour * 60 + endMin) - (startHour * 60 + startMin)) / 60;
-  return hoursPerDay * employee.hourlyRate;
-}
 
 module.exports = router;

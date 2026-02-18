@@ -2,15 +2,17 @@ const express = require('express');
 const router = express.Router();
 const AttendanceLog = require('../models/AttendanceLog');
 const Employee = require('../models/Employee');
+const { adminAuth, authAny } = require('../middleware/auth'); // ✅ Added authAny
+const axios = require('axios'); 
 
-// Helper function to get company month
-function getCompanyMonthRange(date = new Date()) {
+// Helper: Get company month dates
+function getCompanyMonthDates(date = new Date()) {
   const year = date.getFullYear();
   const month = date.getMonth();
   const day = date.getDate();
-  
+
   let startDate, endDate;
-  
+
   if (day >= 18) {
     startDate = new Date(year, month, 18);
     endDate = new Date(year, month + 1, 17);
@@ -18,93 +20,347 @@ function getCompanyMonthRange(date = new Date()) {
     startDate = new Date(year, month - 1, 18);
     endDate = new Date(year, month, 17);
   }
-  
+
   return { startDate, endDate };
 }
 
-// Get payroll summary for all employees (current month)
-router.get('/summary', async (req, res) => {
+// Helper: Check if time is late
+function isLate(inTime, shiftStartTime) {
+  if (!inTime || !shiftStartTime) return false;
+
+  const [inH, inM] = inTime.split(':').map(Number);
+  const [shiftH, shiftM] = shiftStartTime.split(':').map(Number);
+
+  const inMinutes = inH * 60 + inM;
+  const shiftMinutes = shiftH * 60 + shiftM;
+
+  return inMinutes > shiftMinutes;
+}
+
+// **SECTION 1: Attendance & Discipline Overview**
+router.post('/attendance-overview', adminAuth, async (req, res) => {
   try {
-    const { fromDate, toDate } = req.query;
-    
-    const start = fromDate ? new Date(fromDate) : getCompanyMonthRange().startDate;
-    const end = toDate ? new Date(toDate) : new Date();
-    
+    const { fromDate, toDate, filterType } = req.body;
+
+    const start = new Date(fromDate);
+    const end = new Date(toDate);
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    const employees = await Employee.find({
+      status: 'Active',
+      isArchived: false,
+      isDeleted: false
+    });
+
     const attendance = await AttendanceLog.find({
       date: { $gte: start, $lte: end },
       isDeleted: false
-    }).populate('empId', 'firstName lastName email');
-    
-    const summaryMap = {};
-    
-    attendance.forEach(log => {
-      if (!summaryMap[log.empId._id]) {
-        summaryMap[log.empId._id] = {
-          empId: log.empId._id,
-          name: `${log.empId.firstName} ${log.empId.lastName}`,
-          email: log.empId.email,
-          basicEarned: 0,
-          otTotal: 0,
-          deductionTotal: 0,
-          netPayable: 0,
-          days: []
-        };
-      }
-      
-      summaryMap[log.empId._id].basicEarned += (log.financials.hoursPerDay * log.financials.hourlyRate) || 0;
-      summaryMap[log.empId._id].otTotal += log.financials.otAmount || 0;
-      summaryMap[log.empId._id].deductionTotal += log.financials.deduction || 0;
-      summaryMap[log.empId._id].days.push(log);
     });
-    
-    const summary = Object.values(summaryMap).map(emp => ({
-      ...emp,
-      netPayable: emp.basicEarned + emp.otTotal - emp.deductionTotal
+
+    const statusCount = {
+      'On-time': 0,
+      'Late': 0,
+      'Leave': 0,
+      'Absent': 0
+    };
+
+    const detailedList = [];
+
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const currentDate = new Date(d);
+      currentDate.setHours(0, 0, 0, 0);
+
+      for (const emp of employees) {
+        const record = attendance.find(
+          a => a.empId.toString() === emp._id.toString() &&
+               new Date(a.date).getTime() === currentDate.getTime()
+        );
+
+        let status = 'Absent';
+        let delayMinutes = 0;
+        let note = 'No record found';
+
+        if (record) {
+          if (record.status === 'Leave') {
+            status = 'Leave';
+            note = 'Approved leave';
+          } else if (record.status === 'Absent') {
+            status = 'Absent';
+            note = record.metadata?.notes || 'No record found';
+          } else if (record.inOut?.in) {
+            if (isLate(record.inOut.in, record.shift.start)) {
+              status = 'Late';
+              const [inH, inM] = record.inOut.in.split(':').map(Number);
+              const [shiftH, shiftM] = record.shift.start.split(':').map(Number);
+              delayMinutes = ((inH * 60 + inM) - (shiftH * 60 + shiftM));
+              note = `Late by ${delayMinutes} minutes`;
+            } else {
+              status = 'On-time';
+              note = 'On time';
+            }
+          }
+        }
+
+        statusCount[status]++;
+
+        if (!filterType || status.toLowerCase() === filterType.toLowerCase()) {
+          detailedList.push({
+            date: currentDate.toISOString().split('T')[0],
+            empId: emp.employeeNumber,
+            name: `${emp.firstName} ${emp.lastName}`,
+            type: status,
+            reason: note,
+            delayMinutes
+          });
+        }
+      }
+    }
+
+    const total = Object.values(statusCount).reduce((a, b) => a + b, 1);
+    const chartData = Object.entries(statusCount).map(([name, value]) => ({
+      name,
+      value,
+      percentage: ((value / total) * 100).toFixed(1)
     }));
-    
-    res.json({ summary, dateRange: { from: start, to: end } });
+
+    res.json({
+      chartData,
+      detailedList,
+      summary: statusCount
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// Get detailed payroll for specific employee
-router.get('/employee/:empId', async (req, res) => {
+// **SECTION 2: Performance Overview**
+router.post('/performance-overview', adminAuth, async (req, res) => {
   try {
-    const { fromDate, toDate } = req.query;
-    
-    const start = fromDate ? new Date(fromDate) : getCompanyMonthRange().startDate;
-    const end = toDate ? new Date(toDate) : new Date();
-    
+    const { fromDate, toDate } = req.body;
+
+    const start = new Date(fromDate);
+    const end = new Date(toDate);
+
+    const employees = await Employee.find({
+      status: 'Active',
+      isArchived: false,
+      isDeleted: false
+    });
+
+    const performance = [];
+
+    for (const emp of employees) {
+      const empAttendance = await AttendanceLog.find({
+        empId: emp._id,
+        date: { $gte: start, $lte: end },
+        isDeleted: false
+      });
+
+      const present = empAttendance.filter(a => a.status === 'Present' || a.status === 'Late').length;
+      const absent = empAttendance.filter(a => a.status === 'Absent').length;
+      const leave = empAttendance.filter(a => a.status === 'Leave').length;
+
+      const score = empAttendance.length > 0 
+        ? Math.round(((present + leave) / empAttendance.length) * 100)
+        : 0;
+
+      performance.push({
+        empId: emp.employeeNumber,
+        name: `${emp.firstName} ${emp.lastName}`,
+        performanceScore: score,
+        present,
+        absent,
+        leave,
+        status: score >= 90 ? 'Excellent' : score >= 75 ? 'Good' : 'Needs Improvement'
+      });
+    }
+
+    res.json({ performance });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// **SECTION 3: Salary Summary**
+router.post('/salary-summary', adminAuth, async (req, res) => {
+  try {
+    const { fromDate, toDate } = req.body;
+
+    const start = new Date(fromDate);
+    const end = new Date(toDate);
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
     const attendance = await AttendanceLog.find({
-      empId: req.params.empId,
       date: { $gte: start, $lte: end },
       isDeleted: false
     });
-    
-    const dailyBreakdown = attendance.map(log => ({
-      date: log.date,
-      inOut: log.inOut,
-      status: log.status,
-      hoursPerDay: log.financials.hoursPerDay,
-      basePay: log.financials.hoursPerDay * log.financials.hourlyRate,
-      otAmount: log.financials.otAmount,
-      deduction: log.financials.deduction,
-      dailyEarning: log.financials.dailyEarning
-    }));
-    
-    const totals = {
-      basicEarned: dailyBreakdown.reduce((sum, d) => sum + d.basePay, 0),
-      otTotal: dailyBreakdown.reduce((sum, d) => sum + d.otAmount, 0),
-      deductionTotal: dailyBreakdown.reduce((sum, d) => sum + d.deduction, 0),
-      netPayable: dailyBreakdown.reduce((sum, d) => sum + d.dailyEarning, 0)
-    };
-    
-    res.json({
-      dailyBreakdown,
-      totals,
-      dateRange: { from: start, to: end }
+
+    const employees = await Employee.find({
+      status: 'Active',
+      isArchived: false,
+      isDeleted: false
     });
+
+    const summary = [];
+
+    for (const emp of employees) {
+      const empRecords = attendance.filter(a => a.empId.toString() === emp._id.toString());
+
+      const basicEarned = empRecords.reduce((sum, r) => sum + (r.financials?.basePay || 0), 0);
+      const otTotal = empRecords.reduce((sum, r) => sum + (r.financials?.otAmount || 0), 0);
+      const deductionTotal = empRecords.reduce((sum, r) => sum + (r.financials?.deduction || 0), 0);
+      const netPayable = empRecords.reduce((sum, r) => sum + (r.financials?.finalDayEarning || 0), 0);
+
+      summary.push({
+        empId: emp._id,
+        empNumber: emp.employeeNumber,
+        name: `${emp.firstName} ${emp.lastName}`,
+        basicEarned: parseFloat(basicEarned.toFixed(2)),
+        otTotal: parseFloat(otTotal.toFixed(2)),
+        deductionTotal: parseFloat(deductionTotal.toFixed(2)),
+        netPayable: parseFloat(netPayable.toFixed(2)),
+        recordCount: empRecords.length
+      });
+    }
+
+    summary.sort((a, b) => a.name.localeCompare(b.name));
+
+    const totals = {
+      totalBasicEarned: parseFloat(summary.reduce((s, e) => s + e.basicEarned, 0).toFixed(2)),
+      totalOT: parseFloat(summary.reduce((s, e) => s + e.otTotal, 0).toFixed(2)),
+      totalDeductions: parseFloat(summary.reduce((s, e) => s + e.deductionTotal, 0).toFixed(2)),
+      totalNetPayable: parseFloat(summary.reduce((s, e) => s + e.netPayable, 0).toFixed(2))
+    };
+
+    res.json({ summary, totals });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ✅ UPDATED: Changed adminAuth to authAny & added logic check
+router.get('/employee/:empId', authAny, async (req, res) => {
+  try {
+    // ✅ Security: Ensure employees can only see their own data
+    if (req.role !== 'admin' && req.userId.toString() !== req.params.empId) {
+      return res.status(403).json({ message: 'Unauthorized: Access restricted to your own data' });
+    }
+
+    const { fromDate, toDate } = req.query;
+
+    const start = new Date(fromDate);
+    const end = new Date(toDate);
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    const emp = await Employee.findById(req.params.empId);
+    if (!emp) return res.status(404).json({ message: 'Employee not found' });
+
+    const records = await AttendanceLog.find({
+      empId: req.params.empId,
+      date: { $gte: start, $lte: end },
+      isDeleted: false
+    }).sort({ date: 1 });
+
+    const dailyBreakdown = records.map(r => ({
+      date: r.date.toISOString().split('T')[0],
+      inOut: r.inOut,
+      status: r.status,
+      hoursPerDay: r.financials.hoursPerDay,
+      basePay: r.financials.basePay,
+      otAmount: r.financials.otAmount,
+      deduction: r.financials.deduction,
+      dailyEarning: r.financials.finalDayEarning
+    }));
+
+    const totals = {
+      basicEarned: parseFloat(dailyBreakdown.reduce((s, d) => s + d.basePay, 0).toFixed(2)),
+      otTotal: parseFloat(dailyBreakdown.reduce((s, d) => s + d.otAmount, 0).toFixed(2)),
+      deductionTotal: parseFloat(dailyBreakdown.reduce((s, d) => s + d.deduction, 0).toFixed(2)),
+      netPayable: parseFloat(dailyBreakdown.reduce((s, d) => s + d.dailyEarning, 0).toFixed(2))
+    };
+
+    res.json({
+      employee: {
+        id: emp._id,
+        name: `${emp.firstName} ${emp.lastName}`,
+        employeeNumber: emp.employeeNumber,
+        hourlyRate: emp.hourlyRate,
+        shift: emp.shift
+      },
+      dailyBreakdown,
+      totals
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// **Live Monthly Payroll Block**
+router.get('/live-payroll', adminAuth, async (req, res) => {
+  try {
+    const { startDate, endDate } = getCompanyMonthDates();
+
+    const attendance = await AttendanceLog.find({
+      date: { $gte: startDate, $lte: new Date() },
+      isDeleted: false
+    });
+
+    const totalPayroll = attendance.reduce((sum, r) => sum + (r.financials?.finalDayEarning || 0), 0);
+
+    res.json({
+      totalPayroll: parseFloat(totalPayroll.toFixed(2)),
+      periodStart: startDate,
+      periodEnd: endDate,
+      asOf: new Date()
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ✅ UPDATED: Removed external axios call for internal logic consistency
+router.post('/export', adminAuth, async (req, res) => {
+  try {
+    const { fromDate, toDate, format } = req.body;
+
+    const start = new Date(fromDate);
+    const end = new Date(toDate);
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    const attendance = await AttendanceLog.find({
+      date: { $gte: start, $lte: end },
+      isDeleted: false
+    });
+
+    const employees = await Employee.find({ status: 'Active', isDeleted: false });
+
+    const summary = employees.map(emp => {
+      const empRecords = attendance.filter(a => a.empId.toString() === emp._id.toString());
+      return {
+        empNumber: emp.employeeNumber,
+        name: `${emp.firstName} ${emp.lastName}`,
+        basicEarned: empRecords.reduce((sum, r) => sum + (r.financials?.basePay || 0), 0).toFixed(2),
+        otTotal: empRecords.reduce((sum, r) => sum + (r.financials?.otAmount || 0), 0).toFixed(2),
+        deductionTotal: empRecords.reduce((sum, r) => sum + (r.financials?.deduction || 0), 0).toFixed(2),
+        netPayable: empRecords.reduce((sum, r) => sum + (r.financials?.finalDayEarning || 0), 0).toFixed(2)
+      };
+    });
+
+    if (format === 'csv') {
+      let csv = 'Employee Number,Name,Basic Earned,OT Total,Deductions,Net Payable\n';
+      summary.forEach(emp => {
+        csv += `${emp.empNumber},"${emp.name}",${emp.basicEarned},${emp.otTotal},${emp.deductionTotal},${emp.netPayable}\n`;
+      });
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', 'attachment; filename="payroll.csv"');
+      return res.send(csv);
+    }
+    res.status(400).json({ message: 'Unsupported format' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

@@ -3,23 +3,8 @@ const router = express.Router();
 const Employee = require('../models/Employee');
 const { v4: uuidv4 } = require('uuid');
 const { generateTempPassword } = require('../utils/helpers');
-
-// Middleware to verify admin
-const adminAuth = async (req, res, next) => {
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    const jwt = require('jsonwebtoken');
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const admin = await Employee.findById(decoded.id);
-    if (admin.department !== 'Manager') {
-      return res.status(403).json({ message: 'Unauthorized' });
-    }
-    req.admin = admin;
-    next();
-  } catch (error) {
-    res.status(401).json({ message: 'Unauthorized' });
-  }
-};
+// ✅ Import shared middleware from central auth file
+const { adminAuth, authAny } = require('../middleware/auth');
 
 // Get all employees (with filtering and search)
 router.get('/', adminAuth, async (req, res) => {
@@ -58,9 +43,14 @@ router.get('/', adminAuth, async (req, res) => {
   }
 });
 
-// Get single employee
-router.get('/:id', adminAuth, async (req, res) => {
+// ✅ UPDATED: Used authAny and added security check for Employee access
+router.get('/:id', authAny, async (req, res) => {
   try {
+    // Security: Only Admin or the Employee themselves can view this profile
+    if (req.role !== 'admin' && req.userId.toString() !== req.params.id) {
+      return res.status(403).json({ message: 'Unauthorized access' });
+    }
+
     const employee = await Employee.findById(req.params.id).select('-password -tempPassword');
     if (!employee) return res.status(404).json({ message: 'Employee not found' });
     res.json(employee);
@@ -74,7 +64,6 @@ router.post('/', adminAuth, async (req, res) => {
   try {
     const { email, employeeNumber, firstName, lastName, joiningDate, department, shift, hourlyRate, bank } = req.body;
     
-    // Check if employee exists
     const existing = await Employee.findOne({ email });
     if (existing) return res.status(400).json({ message: 'Email already registered' });
     
