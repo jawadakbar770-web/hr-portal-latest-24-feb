@@ -17,12 +17,12 @@ const MONGODB_URI = process.env.MONGODB_URI;
 // Verify required environment variables
 if (!MONGODB_URI) {
   console.error('FATAL: MONGODB_URI environment variable not set');
-  process.exit(1);
+  throw new Error('MONGODB_URI environment variable not set');
 }
 
 // Middleware
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: process.env.FRONTEND_URL || true, // Fine for dev & production
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -32,14 +32,16 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Database Connection
-mongoose.connect(MONGODB_URI)
-  .then(() => {
-    console.log('✓ MongoDB connected');
-  })
-  .catch(err => {
-    console.error('✗ MongoDB connection failed:', err.message);
-    process.exit(1);
-  });
+if (!mongoose.connection.readyState) {
+  mongoose.connect(MONGODB_URI)
+    .then(() => {
+      console.log('✓ MongoDB connected');
+    })
+    .catch(err => {
+      console.error('✗ MongoDB connection failed:', err.message);
+      throw err;
+    });
+}
 
 // Import routes
 import authRoutes from './routes/auth.js';
@@ -77,11 +79,14 @@ app.use((req, res) => {
 // Error Handler (must be last)
 app.use(errorHandler);
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`✓ Server running on port ${PORT}`);
-  console.log(`✓ Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`✓ Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
-});
+// Start server only for local development
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`✓ Server running on port ${PORT}`);
+    console.log(`✓ Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`✓ Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:3000'}`);
+  });
+}
 
+// Export app for Vercel serverless
 export default app;
