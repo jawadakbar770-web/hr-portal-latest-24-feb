@@ -44,15 +44,15 @@ if (!mongoose.connection.readyState) {
 }
 
 // Import routes
-import authRoutes from './routes/auth.js';
-import employeeRoutes from './routes/employees.js';
-import attendanceRoutes from './routes/attendance.js';
-import payrollRoutes from './routes/payroll.js';
-import requestRoutes from './routes/requests.js';
-import notificationRoutes from './routes/notifications.js';
+import authRoutes from '../backend/routes/auth.js';
+import employeeRoutes from '../backend/routes/employees.js';
+import attendanceRoutes from '../backend/routes/attendance.js';
+import payrollRoutes from '../backend/routes/payroll.js';
+import requestRoutes from '../backend/routes/requests.js';
+import notificationRoutes from '../backend/routes/notifications.js';
 
 // Import middleware
-import errorHandler from './middleware/errorHandler.js';
+import errorHandler from '../backend/middleware/errorHandler.js';
 
 // Route registration
 app.use('/api/auth', authRoutes);

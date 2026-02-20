@@ -3,7 +3,7 @@
   "projectSettings": {
     "sourceFilesOutsideRootDirectory": true
   },
-  "buildCommand": "echo 'Build skipped for monorepo'",
+  "buildCommand": "npm install --prefix backend && npm install --prefix frontend && npm run build --prefix frontend",
   "installCommand": "npm install --prefix backend && npm install --prefix frontend",
   "env": {
     "MONGODB_URI": "@mongodb_uri",
@@ -12,7 +12,7 @@
     "REACT_APP_API_URL": "/api"
   },
   "functions": {
-    "backend/server.js": {
+    "api/server.js": {
       "memory": 512,
       "maxDuration": 30
     }
@@ -20,7 +20,7 @@
   "routes": [
     {
       "src": "/api/(.*)",
-      "dest": "backend/server.js",
+      "dest": "api/server.js",
       "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     },
     {
