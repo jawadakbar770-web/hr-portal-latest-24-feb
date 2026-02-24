@@ -79,10 +79,10 @@ async function employeeAuth(req, res, next) {
       return res.status(401).json({ message: 'User not found' });
     }
 
-    // Enforce: Must be employee and active
+    // Enforce: Must be employee and active OR admin
     const role = decoded.role || (user.department === 'Manager' ? 'admin' : 'employee');
     
-    if (role !== 'employee' || user.status !== 'Active') {
+    if (!(role === 'employee' && user.status === 'Active') && role !== 'admin') {
       return res.status(403).json({ message: 'Employee access required' });
     }
 

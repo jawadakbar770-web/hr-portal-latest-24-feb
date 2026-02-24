@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { Calendar, Trash2, Check, X } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -12,11 +12,8 @@ export default function NotificationCenter() {
   const [statusFilter, setStatusFilter] = useState('Pending');
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchRequests();
-  }, [fromDate, toDate, statusFilter]);
-
-  const fetchRequests = async () => {
+  // ✅ Wrap fetchRequests in useCallback
+  const fetchRequests = useCallback(async () => {
     try {
       const token = localStorage.getItem('token');
       const response = await axios.get('/api/notifications/pending', {
@@ -50,7 +47,12 @@ export default function NotificationCenter() {
       toast.error('Failed to fetch requests');
       setLoading(false);
     }
-  };
+  }, [fromDate, toDate, statusFilter]);
+
+  // ✅ Add fetchRequests as dependency
+  useEffect(() => {
+    fetchRequests();
+  }, [fetchRequests]);
 
   const handleApproveLeave = async (requestId) => {
     try {

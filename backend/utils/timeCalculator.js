@@ -3,11 +3,10 @@
  * Handles all time calculations with 24-hour format and overnight shift support
  */
 
-// Validate time format
+// Validate time format (flexible: 9:00, 9:5, 09:00, etc.)
 export function isValidTime(time) {
   if (!time) return false;
-  const regex = /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/;
-  return regex.test(time);
+  return /^([0-1]?[0-9]|2[0-3]):[0-5]?[0-9]$/.test(time);
 }
 
 // Parse time string to minutes

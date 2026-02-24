@@ -1,125 +1,171 @@
 /**
- * CSV Parser Utility
- * Handles parsing and validation of attendance CSV files
- * Format: EmpID | Name | DateTime (MM/DD/YYYY HH:mm) | Type (0=In, 1=Out)
+ * CSV Parser Utility - FINAL VERSION
+ * Format: empid | firstname | lastname | date(dd/mm/yyyy) | time(HH:mm) | status(0=in, 1=out)
  */
 
-// Validate time format (HH:mm)
-export function isValidTime(time) {
-  const regex = /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/;
-  return regex.test(time);
-}
+import { normalizeTime, isValidNormalizedTime } from './timeNormalizer.js';
+import { parseDate, formatDate } from './dateUtils.js';
 
-// Parse CSV content
 export function parseCSV(csvContent) {
   const lines = csvContent.trim().split('\n');
   const parsed = [];
+  const errors = [];
 
-  // Skip header
-  for (let i = 1; i < lines.length; i++) {
+  // Skip header line if present
+  let startIndex = 0;
+  if (lines[0] && lines[0].toLowerCase().includes('empid')) {
+    startIndex = 1;
+  }
+
+  for (let i = startIndex; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
 
+    const rowNumber = i + 1; // 1-based for user display
     const parts = line.split('|').map(p => p.trim());
-    
-    if (parts.length < 4) continue;
 
-    const [empId, name, dateTime, typeStr] = parts;
-    
-    // Parse date and time
-    const [datePart, timePart] = dateTime.split(' ');
-    if (!datePart || !timePart) continue;
+    // Validate columns
+    if (parts.length < 6) {
+      errors.push({
+        rowNumber,
+        error: `Invalid format. Expected 6 columns separated by |, got ${parts.length}`,
+        rawLine: line
+      });
+      continue;
+    }
 
-    const [month, day, year] = datePart.split('/');
-    
-    if (!isValidTime(timePart)) continue;
+    const [empId, firstName, lastName, dateStr, timeStr, statusStr] = parts;
 
-    const type = parseInt(typeStr);
-    if (isNaN(type) || (type !== 0 && type !== 1)) continue;
+    // Validate empId
+    if (!empId) {
+      errors.push({
+        rowNumber,
+        error: 'Employee ID cannot be empty',
+        rawLine: line
+      });
+      continue;
+    }
 
-    // Create date object (UTC midnight)
-    const date = new Date(Date.UTC(
-      parseInt(year),
-      parseInt(month) - 1,
-      parseInt(day),
-      0, 0, 0, 0
-    ));
+    // Validate date format (dd/mm/yyyy)
+    const parsedDate = parseDate(dateStr);
+    if (!parsedDate) {
+      errors.push({
+        rowNumber,
+        error: `Invalid date format. Expected dd/mm/yyyy, got "${dateStr}"`,
+        rawLine: line
+      });
+      continue;
+    }
+
+    // Validate and normalize time
+    const normalizedTime = normalizeTime(timeStr);
+    if (!normalizedTime) {
+      errors.push({
+        rowNumber,
+        error: `Invalid time format. Expected HH:mm or flexible format (9:00, 900, etc.), got "${timeStr}"`,
+        rawLine: line
+      });
+      continue;
+    }
+
+    // Validate status (0 or 1)
+    const status = parseInt(statusStr);
+    if (isNaN(status) || (status !== 0 && status !== 1)) {
+      errors.push({
+        rowNumber,
+        error: `Invalid status. Expected 0 (check-in) or 1 (check-out), got "${statusStr}"`,
+        rawLine: line
+      });
+      continue;
+    }
 
     parsed.push({
+      rowNumber,
       empId: empId.trim().toUpperCase(),
-      name: name.trim(),
-      date,
-      time: timePart.trim(),
-      type // 0 = In, 1 = Out
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
+      date: parsedDate,
+      dateStr: formatDate(parsedDate), // Normalized to dd/mm/yyyy
+      time: normalizedTime,
+      status: status, // 0 = check-in, 1 = check-out
+      isCheckIn: status === 0,
+      isCheckOut: status === 1,
+      rawLine: line
     });
   }
 
-  return parsed;
+  return { parsed, errors };
 }
 
-// Sort CSV rows (Deterministic)
-export function sortCSVRows(rows) {
-  return rows.sort((a, b) => {
-    // Primary: Date ascending
-    const dateCompare = a.date - b.date;
-    if (dateCompare !== 0) return dateCompare;
+/**
+ * Group parsed rows by employee and date for processing
+ * All rows for same employee on same date are grouped together
+ */
+export function groupByEmployeeAndDate(parsedRows) {
+  const grouped = {};
 
-    // Secondary: EmpID ascending
-    const empCompare = a.empId.localeCompare(b.empId);
-    if (empCompare !== 0) return empCompare;
+  for (const row of parsedRows) {
+    const key = `${row.empId}|${row.dateStr}`;
+    if (!grouped[key]) {
+      grouped[key] = {
+        empId: row.empId,
+        firstName: row.firstName,
+        lastName: row.lastName,
+        dateStr: row.dateStr,
+        date: row.date,
+        rows: []
+      };
+    }
+    grouped[key].rows.push({
+      rowNumber: row.rowNumber,
+      time: row.time,
+      isCheckIn: row.isCheckIn,
+      isCheckOut: row.isCheckOut,
+      rawLine: row.rawLine
+    });
+  }
 
-    // Tertiary: Type (In before Out)
-    if (a.type !== b.type) return a.type - b.type;
-
-    // Quaternary: Time ascending
-    return a.time.localeCompare(b.time);
-  });
+  return grouped;
 }
 
-// Apply 14-hour pairing rule
-export function applyPairingRule(inTime, outTime, shiftStartTime) {
+/**
+ * Apply 14-hour rule to determine if times should be paired
+ * If difference is more than 14 hours, they're treated as separate events
+ */
+export function applyPairingRule(inTime, outTime) {
+  if (!inTime || !outTime) return false;
+
   const [inH, inM] = inTime.split(':').map(Number);
   const [outH, outM] = outTime.split(':').map(Number);
-  const [shiftH, shiftM] = shiftStartTime.split(':').map(Number);
 
   const inMinutes = inH * 60 + inM;
-  const outMinutes = outH * 60 + outM;
-  const shiftMinutes = shiftH * 60 + shiftM;
+  let outMinutes = outH * 60 + outM;
 
-  // Calculate difference (handles overnight)
-  let diffMinutes = outMinutes - shiftMinutes;
-  if (diffMinutes < 0) diffMinutes += 24 * 60;
+  // Handle overnight shift
+  if (outMinutes < inMinutes) {
+    outMinutes += 24 * 60;
+  }
 
-  // 14-hour rule
-  return diffMinutes <= 14 * 60;
+  const diffHours = (outMinutes - inMinutes) / 60;
+  return diffHours <= 14; // 14-hour rule
 }
 
-// Merge CSV with database (Progressive completion)
-export function mergeWithDatabase(csvIn, csvOut, dbIn, dbOut, manualOverride) {
-  // If manual override, don't change anything
-  if (manualOverride) {
-    return { in: dbIn, out: dbOut };
-  }
+/**
+ * Merge times: take earliest check-in and latest check-out
+ */
+export function mergeTimes(times) {
+  const checkIns = times.filter(t => t.isCheckIn).map(t => t.time).sort();
+  const checkOuts = times.filter(t => t.isCheckOut).map(t => t.time).sort();
 
-  // Take earlier In
-  let finalIn = csvIn || dbIn;
-  if (csvIn && dbIn) {
-    finalIn = csvIn < dbIn ? csvIn : dbIn;
-  }
-
-  // Take later Out
-  let finalOut = csvOut || dbOut;
-  if (csvOut && dbOut) {
-    finalOut = csvOut > dbOut ? csvOut : dbOut;
-  }
-
-  return { in: finalIn, out: finalOut };
+  return {
+    inTime: checkIns.length > 0 ? checkIns[0] : null,
+    outTime: checkOuts.length > 0 ? checkOuts[checkOuts.length - 1] : null
+  };
 }
 
 export default {
   parseCSV,
-  sortCSVRows,
+  groupByEmployeeAndDate,
   applyPairingRule,
-  mergeWithDatabase,
-  isValidTime
+  mergeTimes
 };

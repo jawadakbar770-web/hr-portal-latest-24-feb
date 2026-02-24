@@ -23,9 +23,8 @@ export default function EmployeeOnboarding() {
   });
 
   useEffect(() => {
-    // Validate token and fetch employee info
     const validateToken = async () => {
-      // In a real app, you'd call an API endpoint to get employee info
+      // Dummy info; backend will validate token
       setEmployeeInfo({
         email: 'employee@example.com',
         shift: { start: '09:00', end: '18:00' },
@@ -79,7 +78,9 @@ export default function EmployeeOnboarding() {
 
     setLoading(true);
     try {
-      await employeeOnboard(token, {
+      // ✅ Updated: send token inside body along with form data
+      await employeeOnboard({
+        token,
         firstName: formData.firstName,
         lastName: formData.lastName,
         password: formData.password,
@@ -87,9 +88,9 @@ export default function EmployeeOnboarding() {
       });
       
       toast.success('Profile completed successfully!');
-      navigate('/employee/dashboard');
+      navigate('/login'); // navigate to login after onboarding
     } catch (error) {
-      toast.error(error.response?.data?.message || 'Onboarding failed');
+      toast.error(error.message || 'Onboarding failed');
     } finally {
       setLoading(false);
     }

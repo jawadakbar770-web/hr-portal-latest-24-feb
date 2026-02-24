@@ -56,23 +56,11 @@ const attendanceLogSchema = new mongoose.Schema({
   shift: {
     start: {
       type: String,
-      required: true,
-      validate: {
-        validator: function(v) {
-          return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v);
-        },
-        message: 'Invalid shift time format'
-      }
+      required: true
     },
     end: {
       type: String,
-      required: true,
-      validate: {
-        validator: function(v) {
-          return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v);
-        },
-        message: 'Invalid shift time format'
-      }
+      required: true
     }
   },
   hourlyRate: {
@@ -129,7 +117,11 @@ const attendanceLogSchema = new mongoose.Schema({
     },
     notes: String,
     lastUpdatedBy: mongoose.Schema.Types.ObjectId,
-    csvImportBatch: String
+    csvImportBatch: String,
+    lastModifiedAt: {
+      type: Date,
+      default: Date.now
+    }
   },
   isDeleted: {
     type: Boolean,
@@ -152,6 +144,14 @@ const attendanceLogSchema = new mongoose.Schema({
 
 // Compound index to ensure one record per employee per date
 attendanceLogSchema.index({ empId: 1, date: 1 }, { unique: true });
+
+// Pre-save hook to update lastModifiedAt
+attendanceLogSchema.pre('save', function(next) {
+  if (this.isModified() && this.metadata) {
+    this.metadata.lastModifiedAt = new Date();
+  }
+  next();
+});
 
 const AttendanceLog = mongoose.model('AttendanceLog', attendanceLogSchema);
 
