@@ -1,17 +1,1 @@
-{
-  "version": 2,
-  "builds": [
-    { "src": "api/server.js", "use": "@vercel/node" },
-    { "src": "frontend/package.json", "use": "@vercel/static-build", "config": { "distDir": "frontend/build" } }
-  ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "api/server.js" },
-    { "src": "/(.*)", "dest": "frontend/build/index.html" }
-  ],
-  "env": {
-    "MONGODB_URI": "mongodb+srv://jawadakbar770_db_user:uBkHaas8kNuz1jd8@cluster0.lr4qbyz.mongodb.net/portal-hr",
-    "JWT_SECRET": "supersecretkeythatisverylongandrandom123456789",
-    "FRONTEND_URL": "https://noori-hr-portal.vercel.app",
-    "REACT_APP_API_URL": "/api"
-  }
-}
+
