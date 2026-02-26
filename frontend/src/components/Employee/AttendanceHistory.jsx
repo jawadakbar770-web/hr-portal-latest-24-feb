@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { MoreVertical, AlertCircle } from 'lucide-react';
 import toast from 'react-hot-toast';
+import {formatToDDMMYYYY} from '../../utils/dateFormatter';
 
 export default function AttendanceHistory() {
   const [fromDate, setFromDate] = useState(() => {
@@ -43,7 +44,10 @@ export default function AttendanceHistory() {
       const user = JSON.parse(localStorage.getItem('user'));
 
       const response = await axios.get('/api/attendance/range', {
-        params: { fromDate, toDate },
+     params: {
+  fromDate: formatToDDMMYYYY(fromDate),
+  toDate: formatToDDMMYYYY(toDate)
+},
         headers: { Authorization: `Bearer ${token}` }
       });
 

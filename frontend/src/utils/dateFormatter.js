@@ -86,6 +86,13 @@ export function toISO(date) {
   return new Date(date).toISOString();
 }
 
+export function formatToDDMMYYYY(dateStr) {
+  if (!dateStr) return "";
+
+  const [year, month, day] = dateStr.split("-");
+  return `${day}/${month}/${year}`;
+}
+
 const dateUtils = {
   parseDate,
   formatDate,
