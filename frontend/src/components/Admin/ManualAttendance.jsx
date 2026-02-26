@@ -5,8 +5,7 @@ import {
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import CSVImportModal from './CSVImportModal.jsx';
-import { formatDate, formatDateTime } from '../../utils/dateFormatter.js';
-import { getDateMinusDays, getTodayDate } from '../../utils/dateFormatter.js';
+import { getDateMinusDays, getTodayDate, parseDate } from '../../utils/dateFormatter.js';
 
 // ─── Attendance Form Modal (Add & Edit) ──────────────────────────────────────
 function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess }) {
@@ -318,13 +317,23 @@ export default function ManualAttendance() {
 
   useEffect(() => { fetchAttendance(); }, [fetchAttendance]);
 
-  const handleDateRangeChange = () => {
-    if (new Date(fromDate) > new Date(toDate)) {
-      toast.error('From date cannot be after to date');
-      return;
-    }
-    fetchAttendance();
-  };
+
+const handleDateRangeChange = () => {
+  const from = parseDate(fromDate);
+  const to   = parseDate(toDate);
+
+  if (!from || !to) {
+    toast.error('Invalid date format. Use dd/mm/yyyy');
+    return;
+  }
+
+  if (from > to) {
+    toast.error('From date cannot be after to date');
+    return;
+  }
+
+  fetchAttendance();
+};
 
   const handleImportSuccess = () => {
     setRefreshing(true);

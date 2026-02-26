@@ -6,6 +6,8 @@
 /**
  * Parse dd/mm/yyyy string to Date object (UTC midnight)
  */
+
+
 export function parseDate(dateStr) {
   if (!dateStr) return null;
 
@@ -98,6 +100,31 @@ export function getDateMinusDays(days) {
   const date = new Date();
   date.setDate(date.getDate() - days);
   return formatDate(date);
+}
+
+export function parseDDMMYYYY(dateStr) {
+  if (!dateStr) return null;
+
+  const parts = dateStr.split('/');
+  if (parts.length !== 3) return null;
+
+  const day = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1; // 0-based
+  const year = parseInt(parts[2], 10);
+
+  const date = new Date(year, month, day);
+
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month ||
+    date.getDate() !== day
+  ) {
+    return null;
+  }
+
+  date.setHours(0, 0, 0, 0);
+
+  return date;
 }
 
 export default {
