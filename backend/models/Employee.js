@@ -1,3 +1,5 @@
+// models/Employee.js
+
 import mongoose from 'mongoose';
 import bcryptjs from 'bcryptjs';
 
@@ -15,14 +17,9 @@ const employeeSchema = new mongoose.Schema({
     unique: true,
     index: true
   },
-  firstName: {
-    type: String,
-    required: true
-  },
-  lastName: {
-    type: String,
-    required: true
-  },
+  firstName:  { type: String, required: true },
+  lastName:   { type: String, required: true },
+
   department: {
     type: String,
     enum: ['IT', 'Customer Support', 'Manager', 'Marketing', 'HR', 'Finance'],
@@ -34,20 +31,17 @@ const employeeSchema = new mongoose.Schema({
     default: 'employee',
     index: true
   },
-  joiningDate: {
-    type: Date,
-    required: true
-  },
+
+  joiningDate: { type: Date, required: true },
+
   shift: {
     start: {
       type: String,
       required: true,
       default: '09:00',
       validate: {
-        validator: function(v) {
-          return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v);
-        },
-        message: 'Shift time must be in HH:mm format (24-hour)'
+        validator: v => /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v),
+        message: 'Shift time must be HH:mm (24-hour)'
       }
     },
     end: {
@@ -55,93 +49,121 @@ const employeeSchema = new mongoose.Schema({
       required: true,
       default: '18:00',
       validate: {
-        validator: function(v) {
-          return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v);
-        },
-        message: 'Shift time must be in HH:mm format (24-hour)'
+        validator: v => /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v),
+        message: 'Shift time must be HH:mm (24-hour)'
       }
     }
+  },
+
+  /**
+   * Salary configuration.
+   *
+   * salaryType:
+   *   'hourly'  — paid per hour worked (hourlyRate × hoursWorked)
+   *   'monthly' — fixed monthly salary; deductions/OT still applied on top
+   *
+   * hourlyRate:
+   *   Always required. For monthly employees it is derived automatically:
+   *     hourlyRate = monthlySalary / (workingDaysPerMonth × scheduledHoursPerDay)
+   *   but we also accept an explicit override.
+   *
+   * monthlySalary:
+   *   Required when salaryType === 'monthly'.
+   *   Used in PayrollRecord to compute gross salary for the period.
+   */
+  salaryType: {
+    type: String,
+    enum: ['hourly', 'monthly'],
+    default: 'hourly',
+    required: true
   },
   hourlyRate: {
     type: Number,
     required: true,
     min: 0
   },
+  monthlySalary: {
+    type: Number,
+    min: 0,
+    default: null   // null means use hourlyRate-based calculation
+  },
+
   status: {
     type: String,
     enum: ['Active', 'Inactive', 'Frozen'],
     default: 'Inactive',
     index: true
   },
-  isArchived: {
-    type: Boolean,
-    default: false
-  },
-  password: String,
-  tempPassword: String,
-  inviteToken: String,
+  isArchived: { type: Boolean, default: false },
+
+  password:          String,
+  tempPassword:      String,
+  inviteToken:       String,
   inviteTokenExpires: Date,
+
   bank: {
-    bankName: String,
-    accountName: String,
+    bankName:      String,
+    accountName:   String,
     accountNumber: String
   },
-  isDeleted: {
-    type: Boolean,
-    default: false
-  },
-  createdAt: {
-    type: Date,
-    default: Date.now
-  },
-  updatedAt: {
-    type: Date,
-    default: Date.now
-  }
+
+  isDeleted: { type: Boolean, default: false }
 }, { timestamps: true });
 
-// Hash password before saving
-employeeSchema.pre('save', async function(next) {
+// ─── Hooks ────────────────────────────────────────────────────────────────────
+
+employeeSchema.pre('save', async function (next) {
+  // Hash passwords only when modified
   if (!this.isModified('password') && !this.isModified('tempPassword')) return next();
-  
+
   try {
-    if (this.password) {
+    if (this.isModified('password') && this.password) {
       const salt = await bcryptjs.genSalt(10);
       this.password = await bcryptjs.hash(this.password, salt);
     }
-    
-    if (this.tempPassword) {
+    if (this.isModified('tempPassword') && this.tempPassword) {
       const salt = await bcryptjs.genSalt(10);
       this.tempPassword = await bcryptjs.hash(this.tempPassword, salt);
     }
-    
     next();
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 });
 
-// Method to compare passwords
-employeeSchema.methods.comparePassword = async function(enteredPassword) {
-  return await bcryptjs.compare(enteredPassword, this.password);
+// ─── Instance methods ─────────────────────────────────────────────────────────
+
+employeeSchema.methods.comparePassword = async function (entered) {
+  return bcryptjs.compare(entered, this.password);
 };
 
-// Method to check if employee is eligible for leave (3 months)
-employeeSchema.methods.isLeaveEligible = function() {
-  const now = new Date();
-  const joinDate = new Date(this.joiningDate);
-  const daysElapsed = Math.floor((now - joinDate) / (1000 * 60 * 60 * 24));
-  return daysElapsed >= 90;
+employeeSchema.methods.isLeaveEligible = function () {
+  const days = Math.floor((Date.now() - new Date(this.joiningDate)) / 86_400_000);
+  return days >= 90;
 };
 
-// Method to get days until leave eligibility
-employeeSchema.methods.getDaysUntilLeaveEligible = function() {
-  const now = new Date();
-  const joinDate = new Date(this.joiningDate);
-  const daysElapsed = Math.floor((now - joinDate) / (1000 * 60 * 60 * 24));
-  return Math.max(0, 90 - daysElapsed);
+employeeSchema.methods.getDaysUntilLeaveEligible = function () {
+  const days = Math.floor((Date.now() - new Date(this.joiningDate)) / 86_400_000);
+  return Math.max(0, 90 - days);
+};
+
+/**
+ * Compute effective hourly rate for payroll calculations.
+ * For monthly employees: monthlySalary / (avgWorkingDays × shiftHours).
+ * Falls back to the stored hourlyRate if monthlySalary is not set.
+ *
+ * @param {number} workingDaysInPeriod  – actual working days in the payroll period
+ * @param {number} scheduledHoursPerDay – hours per scheduled shift (default 8)
+ */
+employeeSchema.methods.getEffectiveHourlyRate = function (
+  workingDaysInPeriod = 26,
+  scheduledHoursPerDay = 8
+) {
+  if (this.salaryType === 'monthly' && this.monthlySalary) {
+    return this.monthlySalary / (workingDaysInPeriod * scheduledHoursPerDay);
+  }
+  return this.hourlyRate;
 };
 
 const Employee = mongoose.model('Employee', employeeSchema);
-
 export default Employee;

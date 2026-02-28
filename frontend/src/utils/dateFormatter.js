@@ -1,90 +1,123 @@
 /**
- * Date Formatter Utility
- * All dates use dd/mm/yyyy format consistently
+ * utils/dateFormatter.js
+ *
+ * Frontend date utilities.
+ * All API dates arrive as ISO strings or dd/mm/yyyy — this file converts both.
+ *
+ * Rule: display always uses dd/mm/yyyy.
+ *       <input type="date"> always uses yyyy-mm-dd (HTML spec).
+ *       API query params accept both (backend's buildDateRange handles it).
  */
 
+// ─── parsing ──────────────────────────────────────────────────────────────────
+
 /**
- * Parse dd/mm/yyyy string to Date object
+ * Parse a date string to a JS Date at midnight local time.
+ * Accepts:
+ *   dd/mm/yyyy           — display format
+ *   yyyy-mm-dd           — HTML input format / API format
+ *   ISO datetime string  — from JSON payloads / MongoDB
+ * Returns null for invalid input.
  */
 export function parseDate(dateStr) {
   if (!dateStr) return null;
+  const s = String(dateStr).trim();
 
-  const trimmed = String(dateStr).trim();
-  const parts = trimmed.split('/');
-
-  if (parts.length !== 3) return null;
-
-  const day = parseInt(parts[0]);
-  const month = parseInt(parts[1]);
-  const year = parseInt(parts[2]);
-
-  if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
-  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
-  if (year < 1900 || year > 2100) return null;
-
-  const date = new Date(year, month - 1, day);
-  
-  // Validate date is real
-  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
-    return null;
+  // dd/mm/yyyy
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
+    const [d, m, y] = s.split('/').map(Number);
+    if (m < 1 || m > 12 || d < 1 || d > 31 || y < 1900 || y > 2100) return null;
+    const date = new Date(y, m - 1, d);
+    if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return null;
+    return date;
   }
 
-  return date;
+  // yyyy-mm-dd  or  ISO datetime
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    const [y, m, d] = s.slice(0, 10).split('-').map(Number);
+    if (m < 1 || m > 12 || d < 1 || d > 31 || y < 1900 || y > 2100) return null;
+    const date = new Date(y, m - 1, d);
+    if (date.getFullYear() !== y || date.getMonth() !== m - 1 || date.getDate() !== d) return null;
+    return date;
+  }
+
+  return null;
 }
 
-/**
- * Format Date object to dd/mm/yyyy
- */
+// ─── formatting ───────────────────────────────────────────────────────────────
+
+/** Date → "dd/mm/yyyy" (display) */
 export function formatDate(date) {
   if (!date) return '';
-
   const d = new Date(date);
   if (isNaN(d.getTime())) return '';
-  
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-
-  return `${day}/${month}/${year}`;
+  return [
+    String(d.getDate()).padStart(2, '0'),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    d.getFullYear()
+  ].join('/');
 }
 
-/**
- * Format Date object to dd/mm/yyyy HH:mm for display
- */
+/** Date → "dd/mm/yyyy HH:mm" (display with time) */
 export function formatDateTime(date) {
   if (!date) return '';
-
   const d = new Date(date);
   if (isNaN(d.getTime())) return '';
-
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-  const hours = String(d.getHours()).padStart(2, '0');
-  const minutes = String(d.getMinutes()).padStart(2, '0');
-
-  return `${day}/${month}/${year} ${hours}:${minutes}`;
+  return formatDate(d) + ' ' + [
+    String(d.getHours()).padStart(2, '0'),
+    String(d.getMinutes()).padStart(2, '0')
+  ].join(':');
 }
 
 /**
- * Get today's date in dd/mm/yyyy
+ * "dd/mm/yyyy" → "yyyy-mm-dd"
+ * Use for <input type="date" value={...}> — HTML date inputs require yyyy-mm-dd.
  */
+export function formatToYYYYMMDD(dateStr) {
+  if (!dateStr) return '';
+  // If already yyyy-mm-dd just return it
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+  const parts = dateStr.split('/');
+  if (parts.length !== 3) return '';
+  return `${parts[2]}-${parts[1]}-${parts[0]}`;
+}
+
+/**
+ * "yyyy-mm-dd" or ISO → "dd/mm/yyyy"
+ * Use when displaying backend data in the UI.
+ */
+export function formatToDDMMYYYY(dateStr) {
+  if (!dateStr) return '';
+  return formatDate(new Date(dateStr));
+}
+
+// ─── convenience ─────────────────────────────────────────────────────────────
+
+/** Today as "dd/mm/yyyy" */
 export function getTodayDate() {
   return formatDate(new Date());
 }
 
-/**
- * Get date minus days in dd/mm/yyyy
- */
-export function getDateMinusDays(days) {
-  const date = new Date();
-  date.setDate(date.getDate() - days);
-  return formatDate(date);
+/** Today as "yyyy-mm-dd" (for <input type="date" max={...}>) */
+export function getTodayISO() {
+  return new Date().toISOString().slice(0, 10);
 }
 
-/**
- * Convert JavaScript Date to ISO string
- */
+/** N days before today as "dd/mm/yyyy" */
+export function getDateMinusDays(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return formatDate(d);
+}
+
+/** N days before today as "yyyy-mm-dd" */
+export function getDateMinusDaysISO(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Date → ISO string, null if invalid */
 export function toISO(date) {
   if (!date) return null;
   const d = new Date(date);
@@ -92,35 +125,27 @@ export function toISO(date) {
 }
 
 /**
- * Convert YYYY-MM-DD or ISO string to dd/mm/yyyy
- * Used for displaying backend data in the UI
+ * Build a default date range object for API calls.
+ * @param {number} daysBack - how far back from today (default 30)
+ * @returns {{ startDate: string, endDate: string }} in dd/mm/yyyy
  */
-export function formatToDDMMYYYY(dateStr) {
-  if (!dateStr) return "";
-  const d = new Date(dateStr);
-  return formatDate(d);
+export function defaultDateRange(daysBack = 30) {
+  return {
+    startDate: getDateMinusDays(daysBack),
+    endDate:   getTodayDate()
+  };
 }
 
-/**
- * Convert dd/mm/yyyy string to yyyy-mm-dd
- * Used specifically to set the value of <input type="date"> calendar pickers
- */
-export function formatToYYYYMMDD(dateStr) {
-  if (!dateStr) return "";
-  const parts = dateStr.split('/');
-  if (parts.length !== 3) return dateStr; // Return original if not in dd/mm/yyyy
-  return `${parts[2]}-${parts[1]}-${parts[0]}`;
-}
-
-const dateUtils = {
+export default {
   parseDate,
   formatDate,
   formatDateTime,
-  getTodayDate,
-  getDateMinusDays,
-  toISO,
+  formatToYYYYMMDD,
   formatToDDMMYYYY,
-  formatToYYYYMMDD
+  getTodayDate,
+  getTodayISO,
+  getDateMinusDays,
+  getDateMinusDaysISO,
+  toISO,
+  defaultDateRange
 };
-
-export default dateUtils;

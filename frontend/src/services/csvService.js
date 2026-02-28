@@ -1,104 +1,74 @@
 /**
- * CSV Import Service
- * Handles CSV file upload and processing
+ * services/csvService.js
+ *
+ * CSV import + attendance range queries.
+ * Uses the central apiClient — no manual token handling or URL construction.
  */
 
-import axios from 'axios';
+import apiClient from './api.js';
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
+// ─── CSV upload ───────────────────────────────────────────────────────────────
 
+/**
+ * POST /api/attendance/import-csv
+ * Uploads a CSV file and returns the processing log + summary.
+ *
+ * @param   {File}   file — the .csv File object from an <input type="file">
+ * @returns {Object} { success, data, processingLog } on success
+ *                   { success: false, error, processingLog } on failure
+ */
 export async function uploadCSVFile(file) {
   try {
     const formData = new FormData();
     formData.append('csvFile', file);
 
-    const token = localStorage.getItem('token');
-    
-    if (!token) {
-      return {
-        success: false,
-        error: 'No authentication token found',
-        processingLog: [{
-          type: 'ERROR',
-          message: 'Authentication error: Please login again'
-        }]
-      };
-    }
-
-    const response = await axios.post(
-      `${API_BASE_URL}/attendance/import-csv`,
-      formData,
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'multipart/form-data'
-        },
-        timeout: 60000 // 60 seconds timeout for large files
-      }
-    );
+    const { data } = await apiClient.post('/attendance/import-csv', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60_000   // large files can take a while
+    });
 
     return {
-      success: true,
-      data: response.data,
-      processingLog: response.data.processingLog || []
+      success:       true,
+      data,
+      processingLog: data.processingLog || []
     };
   } catch (error) {
-    let errorMsg = error.message;
-    let processingLogs = [];
-
-    if (error.response) {
-      errorMsg = error.response.data?.message || error.response.statusText;
-      processingLogs = error.response.data?.processingLog || [];
-    } else if (error.request) {
-      errorMsg = 'No response from server. Please check your connection.';
-    }
+    const errMsg  = error.response?.data?.message || error.message || 'Upload failed';
+    const logData = error.response?.data?.processingLog;
 
     return {
-      success: false,
-      error: errorMsg,
-      processingLog: processingLogs.length > 0 ? processingLogs : [{
-        type: 'ERROR',
-        message: errorMsg
-      }]
+      success:       false,
+      error:         errMsg,
+      processingLog: logData?.length
+        ? logData
+        : [{ type: 'ERROR', message: errMsg }]
     };
   }
 }
 
+// ─── attendance range ─────────────────────────────────────────────────────────
+
+/**
+ * GET /api/attendance/range?fromDate=dd/mm/yyyy&toDate=dd/mm/yyyy
+ *
+ * @param {string} fromDate — dd/mm/yyyy
+ * @param {string} toDate   — dd/mm/yyyy
+ */
 export async function getAttendanceRange(fromDate, toDate) {
   try {
-    const token = localStorage.getItem('token');
-
-    if (!token) {
-      return {
-        success: false,
-        error: 'No authentication token found'
-      };
-    }
-
-    const response = await axios.get(
-      `${API_BASE_URL}/attendance/range?fromDate=${fromDate}&toDate=${toDate}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      }
-    );
-
-    return {
-      success: true,
-      data: response.data
-    };
+    const { data } = await apiClient.get('/attendance/range', {
+      params: { fromDate, toDate }
+    });
+    return { success: true, data };
   } catch (error) {
     return {
       success: false,
-      error: error.response?.data?.message || error.message
+      error:   error.response?.data?.message || error.message
     };
   }
 }
 
-const csvService = {
+export default {
   uploadCSVFile,
   getAttendanceRange
 };
-
-export default csvService;

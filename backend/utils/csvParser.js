@@ -1,48 +1,64 @@
 /**
- * CSV Parser Utility - FINAL VERSION
- * Format: empid | firstname | lastname | date(dd/mm/yyyy) | time(HH:mm) | status(0=in, 1=out)
- * Supports both pipe (|) and comma (,) delimiters — auto-detected per file
+ * CSV Parser Utility
+ *
+ * Expected CSV format (pipe or comma delimited, auto-detected):
+ *   empid | firstname | lastname | date(dd/mm/yyyy) | time(HH:mm) | status(0=in, 1=out)
+ *
+ * Night-shift 14-hour rule (req #4):
+ *   Given a shift start (e.g. 22:00) the system looks for the employee's
+ *   check-IN as the first typed-IN punch >= shiftStart within a 14-hour
+ *   window, then finds their check-OUT as the first typed-OUT punch that
+ *   also falls within that same 14-hour window FROM SHIFT START (not from
+ *   check-in time). If the raw out time is numerically less than the raw in
+ *   time, outNextDay is set to true.
  */
 
-import { normalizeTime, isValidNormalizedTime } from './timeNormalizer.js';
+// utils/csvParser.js
+
+import { normalizeTime } from './timeNormalizer.js';
 import { parseDate, formatDate } from './dateUtils.js';
 
-/**
- * Detect delimiter used in CSV content (pipe or comma)
- */
+// ─── delimiter detection ──────────────────────────────────────────────────────
+
 function detectDelimiter(csvContent) {
-  const firstLine = csvContent.trim().split('\n')[0] || '';
-  const pipeCount = (firstLine.match(/\|/g) || []).length;
-  const commaCount = (firstLine.match(/,/g) || []).length;
-  return pipeCount >= commaCount ? '|' : ',';
+  const first = csvContent.trim().split('\n')[0] || '';
+  const pipes  = (first.match(/\|/g) || []).length;
+  const commas = (first.match(/,/g)  || []).length;
+  return pipes >= commas ? '|' : ',';
 }
 
-export function parseCSV(csvContent) {
-  const lines = csvContent.trim().split('\n');
-  const parsed = [];
-  const errors = [];
+// ─── helpers ──────────────────────────────────────────────────────────────────
 
-  // Auto-detect delimiter
+/** "HH:mm" → total minutes from midnight */
+const toMin = (t) => {
+  if (!t) return 0;
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
+};
+
+// ─── parseCSV ─────────────────────────────────────────────────────────────────
+
+export function parseCSV(csvContent) {
+  const lines     = csvContent.trim().split('\n');
+  const parsed    = [];
+  const errors    = [];
   const delimiter = detectDelimiter(csvContent);
 
-  // Skip header line if present
+  // Skip header row if present
   let startIndex = 0;
-  if (lines[0] && lines[0].toLowerCase().includes('empid')) {
-    startIndex = 1;
-  }
+  if (lines[0]?.toLowerCase().includes('empid')) startIndex = 1;
 
   for (let i = startIndex; i < lines.length; i++) {
-    const line = lines[i].trim();
+    const line      = lines[i].trim();
     if (!line) continue;
 
-    const rowNumber = i + 1; // 1-based for user display
-    const parts = line.split(delimiter).map(p => p.trim());
+    const rowNumber = i + 1;
+    const parts     = line.split(delimiter).map(p => p.trim());
 
-    // Validate columns
     if (parts.length < 6) {
       errors.push({
         rowNumber,
-        error: `Invalid format. Expected 6 columns separated by "${delimiter}", got ${parts.length}`,
+        error:   `Expected 6 columns (delimiter "${delimiter}"), got ${parts.length}`,
         rawLine: line
       });
       continue;
@@ -50,136 +66,171 @@ export function parseCSV(csvContent) {
 
     const [empId, firstName, lastName, dateStr, timeStr, statusStr] = parts;
 
-    // Validate empId
     if (!empId) {
-      errors.push({
-        rowNumber,
-        error: 'Employee ID cannot be empty',
-        rawLine: line
-      });
+      errors.push({ rowNumber, error: 'Employee ID is empty', rawLine: line });
       continue;
     }
 
-    // Validate date format (dd/mm/yyyy)
     const parsedDate = parseDate(dateStr);
     if (!parsedDate) {
-      errors.push({
-        rowNumber,
-        error: `Invalid date format. Expected dd/mm/yyyy, got "${dateStr}"`,
-        rawLine: line
-      });
+      errors.push({ rowNumber, error: `Invalid date "${dateStr}" (expected dd/mm/yyyy)`, rawLine: line });
       continue;
     }
 
-    // Validate and normalize time
     const normalizedTime = normalizeTime(timeStr);
     if (!normalizedTime) {
-      errors.push({
-        rowNumber,
-        error: `Invalid time format. Expected HH:mm or flexible format (9:00, 900, etc.), got "${timeStr}"`,
-        rawLine: line
-      });
+      errors.push({ rowNumber, error: `Invalid time "${timeStr}"`, rawLine: line });
       continue;
     }
 
-    // Validate status (0 or 1)
-    const status = parseInt(statusStr);
+    const status = parseInt(statusStr, 10);
     if (isNaN(status) || (status !== 0 && status !== 1)) {
-      errors.push({
-        rowNumber,
-        error: `Invalid status. Expected 0 (check-in) or 1 (check-out), got "${statusStr}"`,
-        rawLine: line
-      });
+      errors.push({ rowNumber, error: `Invalid status "${statusStr}" (0=in, 1=out)`, rawLine: line });
       continue;
     }
 
     parsed.push({
       rowNumber,
-      empId: empId.trim().toUpperCase(),
-      firstName: firstName.trim(),
-      lastName: lastName.trim(),
-      date: parsedDate,
-      dateStr: formatDate(parsedDate), // Normalized to dd/mm/yyyy
-      time: normalizedTime,
-      status: status, // 0 = check-in, 1 = check-out
-      isCheckIn: status === 0,
+      empId:      empId.trim().toUpperCase(),
+      firstName:  firstName.trim(),
+      lastName:   lastName.trim(),
+      date:       parsedDate,
+      dateStr:    formatDate(parsedDate),
+      time:       normalizedTime,
+      status,
+      isCheckIn:  status === 0,
       isCheckOut: status === 1,
-      rawLine: line
+      rawLine:    line
     });
   }
 
   return { parsed, errors };
 }
 
-/**
- * Group parsed rows by employee and date for processing
- * All rows for same employee on same date are grouped together
- */
+// ─── groupByEmployeeAndDate ───────────────────────────────────────────────────
+//
+// Groups all punches for the same employee on the same calendar date.
+// NOTE: for night-shift employees, all punches for a shift belong to the
+// shift-start date even if the out punch occurs the next calendar day.
+// That resolution happens in mergeTimes / applyNightShiftPairing — here we
+// simply group by the date column as written in the CSV.
+
 export function groupByEmployeeAndDate(parsedRows) {
   const grouped = {};
 
   for (const row of parsedRows) {
     const key = `${row.empId}|${row.dateStr}`;
+
     if (!grouped[key]) {
       grouped[key] = {
-        empId: row.empId,
+        empId:     row.empId,
         firstName: row.firstName,
-        lastName: row.lastName,
-        dateStr: row.dateStr,
-        date: row.date,
-        rows: []
+        lastName:  row.lastName,
+        dateStr:   row.dateStr,
+        date:      row.date,
+        rows:      []
       };
     }
+
     grouped[key].rows.push({
-      rowNumber: row.rowNumber,
-      time: row.time,
-      isCheckIn: row.isCheckIn,
+      rowNumber:  row.rowNumber,
+      time:       row.time,
+      isCheckIn:  row.isCheckIn,
       isCheckOut: row.isCheckOut,
-      rawLine: row.rawLine
+      rawLine:    row.rawLine
     });
   }
 
   return grouped;
 }
 
-/**
- * Apply 14-hour rule to determine if times should be paired
- * If difference is more than 14 hours, they're treated as separate events
- */
-export function applyPairingRule(inTime, outTime) {
-  if (!inTime || !outTime) return false;
+// ─── mergeTimes ───────────────────────────────────────────────────────────────
+//
+// Used when the CSV rows already carry typed IN/OUT status (status 0/1).
+// Takes the earliest check-in and latest check-out from the group.
+//
+// Returns { inTime, outTime, outNextDay }
+//   outNextDay = true when the raw outTime is numerically before inTime
+//   (i.e. the check-out crossed midnight).
 
-  const [inH, inM] = inTime.split(':').map(Number);
-  const [outH, outM] = outTime.split(':').map(Number);
+export function mergeTimes(rows) {
+  const ins  = rows.filter(r => r.isCheckIn).map(r => r.time).sort();
+  const outs = rows.filter(r => r.isCheckOut).map(r => r.time).sort();
 
-  const inMinutes = inH * 60 + inM;
-  let outMinutes = outH * 60 + outM;
+  const inTime  = ins.length  > 0 ? ins[0]               : null;
+  const outTime = outs.length > 0 ? outs[outs.length - 1] : null;
 
-  // Handle overnight shift
-  if (outMinutes < inMinutes) {
-    outMinutes += 24 * 60;
+  // Detect midnight crossing: raw out time is numerically less than in time
+  const outNextDay = !!(inTime && outTime && toMin(outTime) < toMin(inTime));
+
+  return { inTime, outTime, outNextDay };
+}
+
+// ─── applyNightShiftPairing ───────────────────────────────────────────────────
+//
+// The 14-hour pairing rule for raw (untyped) punch lists or when the CSV
+// carries only a single status column that is unreliable.
+//
+// Algorithm (req #4):
+//   1. Build a "shift timeline" — any punch whose raw minute value is less
+//      than shiftStart is assumed to be next-day, so add 1440 to normalise it.
+//   2. Sort all punches on this normalised timeline.
+//   3. inTime  = first punch whose normalised value is in [shiftStart, shiftStart+14h]
+//   4. outTime = first punch AFTER inTime whose normalised value is
+//                still within shiftStart + 14h  (window is from SHIFT START,
+//                not from check-in — this is the key fix vs the old version)
+//   5. outNextDay = raw out minute < raw in minute (crossed midnight)
+//
+// Returns { inTime, outTime, outNextDay }
+
+export function applyNightShiftPairing(shiftStart, punchTimes) {
+  if (!punchTimes || punchTimes.length === 0) {
+    return { inTime: null, outTime: null, outNextDay: false };
   }
 
-  const diffHours = (outMinutes - inMinutes) / 60;
-  return diffHours <= 14; // 14-hour rule
+  const shiftStartMin = toMin(shiftStart);
+  const windowEnd     = shiftStartMin + 14 * 60;   // 14 h from shift start
+
+  // Normalise: punches that appear before shift start are next-day
+  const normalised = punchTimes
+    .filter(Boolean)
+    .map(t => {
+      let m = toMin(t);
+      if (m < shiftStartMin) m += 1440;
+      return { time: t, norm: m };
+    })
+    .sort((a, b) => a.norm - b.norm);
+
+  // inTime: first punch inside the 14-h window
+  const inEntry = normalised.find(p => p.norm >= shiftStartMin && p.norm <= windowEnd);
+  if (!inEntry) return { inTime: null, outTime: null, outNextDay: false };
+
+  // outTime: first punch strictly after inEntry and still within window
+  // Window is measured from SHIFT START (not from inEntry) — req #4 spec
+  const outEntry = normalised.find(p => p.norm > inEntry.norm && p.norm <= windowEnd);
+  if (!outEntry) return { inTime: inEntry.time, outTime: null, outNextDay: false };
+
+  const outNextDay = toMin(outEntry.time) < toMin(inEntry.time);
+
+  return { inTime: inEntry.time, outTime: outEntry.time, outNextDay };
 }
 
 /**
- * Merge times: take earliest check-in and latest check-out
+ * applyPairingRule — kept for backward compatibility.
+ * Returns true if inTime and outTime are within 14 hours of each other.
+ * @deprecated Use applyNightShiftPairing for actual time resolution.
  */
-export function mergeTimes(times) {
-  const checkIns = times.filter(t => t.isCheckIn).map(t => t.time).sort();
-  const checkOuts = times.filter(t => t.isCheckOut).map(t => t.time).sort();
-
-  return {
-    inTime: checkIns.length > 0 ? checkIns[0] : null,
-    outTime: checkOuts.length > 0 ? checkOuts[checkOuts.length - 1] : null
-  };
+export function applyPairingRule(inTime, outTime) {
+  if (!inTime || !outTime) return false;
+  let diff = toMin(outTime) - toMin(inTime);
+  if (diff < 0) diff += 1440;
+  return diff / 60 <= 14;
 }
 
 export default {
   parseCSV,
   groupByEmployeeAndDate,
-  applyPairingRule,
-  mergeTimes
+  mergeTimes,
+  applyNightShiftPairing,
+  applyPairingRule
 };

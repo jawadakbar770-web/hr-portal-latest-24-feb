@@ -3,6 +3,8 @@
  * Handles copying text to clipboard with fallback support
  */
 
+// utils/clipboard.js
+
 export async function copyToClipboard(text) {
   // Try modern Clipboard API first
   if (navigator.clipboard && navigator.clipboard.writeText) {

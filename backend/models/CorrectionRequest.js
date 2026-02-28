@@ -1,3 +1,5 @@
+// models/CorrectionRequest.js
+
 import mongoose from 'mongoose';
 
 const correctionRequestSchema = new mongoose.Schema({

@@ -1,49 +1,72 @@
-/**
- * Global Error Handler Middleware
- * Catches and formats all application errors
- */
+// middleware/errorHandler.js
+
+const isDev = process.env.NODE_ENV !== 'production';
 
 const errorHandler = (err, req, res, next) => {
-  console.error('Error:', err);
+  // Always log in dev; in prod log only 5xx
+  if (isDev || !err.statusCode || err.statusCode >= 500) {
+    console.error(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+    console.error(err);
+  }
 
-  // Mongoose validation error
+  // ── Mongoose: document not found / bad ObjectId ──────────────────────────
+  if (err.name === 'CastError' && err.kind === 'ObjectId') {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid ID format'
+    });
+  }
+
+  // ── Mongoose: schema validation failed ───────────────────────────────────
   if (err.name === 'ValidationError') {
-    const messages = Object.values(err.errors).map(e => e.message);
+    const errors = Object.values(err.errors).map(e => e.message);
     return res.status(400).json({
+      success: false,
       message: 'Validation Error',
-      errors: messages
+      errors
     });
   }
 
-  // Mongoose duplicate key error
+  // ── Mongoose: duplicate key (unique index) ────────────────────────────────
   if (err.code === 11000) {
-    const field = Object.keys(err.keyValue)[0];
-    return res.status(400).json({
-      message: `${field} already exists`
+    const field   = Object.keys(err.keyValue || {})[0] ?? 'field';
+    const value   = err.keyValue?.[field];
+    return res.status(409).json({
+      success: false,
+      message: `${field} '${value}' already exists`
     });
   }
 
-  // JWT errors
+  // ── JWT errors ────────────────────────────────────────────────────────────
   if (err.name === 'JsonWebTokenError') {
-    return res.status(401).json({ message: 'Invalid token' });
+    return res.status(401).json({ success: false, message: 'Invalid token' });
   }
-
   if (err.name === 'TokenExpiredError') {
-    return res.status(401).json({ message: 'Token expired' });
+    return res.status(401).json({ success: false, message: 'Token expired' });
   }
 
-  // Custom API errors
+  // ── Custom API errors (throw with err.statusCode) ─────────────────────────
   if (err.statusCode) {
     return res.status(err.statusCode).json({
-      message: err.message
+      success: false,
+      message: err.message,
+      ...(isDev && { stack: err.stack })
     });
   }
 
-  // Default error
+  // ── Multer errors ─────────────────────────────────────────────────────────
+  if (err.name === 'MulterError') {
+    return res.status(400).json({
+      success: false,
+      message: `File upload error: ${err.message}`
+    });
+  }
+
+  // ── Default 500 ───────────────────────────────────────────────────────────
   res.status(500).json({
-    message: process.env.NODE_ENV === 'production' 
-      ? 'Internal Server Error'
-      : err.message
+    success: false,
+    message: isDev ? err.message : 'Internal Server Error',
+    ...(isDev && { stack: err.stack })
   });
 };
 

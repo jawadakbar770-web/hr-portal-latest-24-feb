@@ -12,6 +12,7 @@ export default function AddEmployeeModal({ onClose, onSave }) {
   const [generatedLink, setGeneratedLink] = useState(null);
   const [newEmployee, setNewEmployee] = useState(null);
   const dateInputRef = useRef(null);
+
   const [formData, setFormData] = useState({
     firstName: '',
     lastName: '',
@@ -20,80 +21,81 @@ export default function AddEmployeeModal({ onClose, onSave }) {
     department: 'IT',
     joiningDate: new Date().toISOString().split('T')[0],
     shift: { start: '09:00', end: '18:00' },
+    salaryType: 'hourly',       // FIX #1: added salaryType
     hourlyRate: 0,
+    monthlySalary: '',          // FIX #1: added monthlySalary
     bank: { bankName: '', accountName: '', accountNumber: '' }
   });
+
   const [errors, setErrors] = useState({});
 
   const handleInputChange = (e) => {
     const { name, value } = e.target;
     setErrors(prev => ({ ...prev, [name]: '' }));
-    
+
     if (name.includes('.')) {
       const [parent, child] = name.split('.');
-      setFormData({
-        ...formData,
-        [parent]: { ...formData[parent], [child]: value }
-      });
+      setFormData(prev => ({
+        ...prev,
+        [parent]: { ...prev[parent], [child]: value }
+      }));
     } else {
-      setFormData({ ...formData, [name]: value });
+      setFormData(prev => ({ ...prev, [name]: value }));
     }
   };
 
+  // Estimated monthly salary preview (hourly employees only)
   const calculateMonthlySalary = () => {
-    if (!formData.hourlyRate || !formData.shift.start || !formData.shift.end) {
-      return 0;
-    }
+    if (!formData.hourlyRate || !formData.shift.start || !formData.shift.end) return 0;
 
     const [startH, startM] = formData.shift.start.split(':').map(Number);
-    const [endH, endM] = formData.shift.end.split(':').map(Number);
-    
-    let startMin = startH * 60 + startM;
-    let endMin = endH * 60 + endM;
+    const [endH, endM]     = formData.shift.end.split(':').map(Number);
 
-    if (endMin < startMin) {
-      endMin += 24 * 60;
-    }
+    let startMin = startH * 60 + startM;
+    let endMin   = endH * 60 + endM;
+    if (endMin <= startMin) endMin += 24 * 60; // night shift
 
     const hoursPerDay = (endMin - startMin) / 60;
-    const monthlySalary = hoursPerDay * 22 * parseFloat(formData.hourlyRate);
-    
-    return monthlySalary.toFixed(2);
+    return (hoursPerDay * 22 * parseFloat(formData.hourlyRate)).toFixed(2);
   };
 
-  const isValidTime = (time) => {
-    const regex = /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/;
-    return regex.test(time);
-  };
+  const isValidTime = (time) => /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(time);
 
   const validateForm = () => {
     const newErrors = {};
 
-    if (!formData.firstName.trim()) {
-      newErrors.firstName = 'First name is required';
+    // Basic tab
+    if (!formData.firstName.trim())    newErrors.firstName      = 'First name is required';
+    if (!formData.lastName.trim())     newErrors.lastName       = 'Last name is required';
+    if (!formData.email.trim())        newErrors.email          = 'Email is required';
+    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email))
+                                       newErrors.email          = 'Invalid email format';
+    if (!formData.employeeNumber.trim()) newErrors.employeeNumber = 'Employee number is required';
+    if (!formData.joiningDate)         newErrors.joiningDate    = 'Joining date is required';
+
+    // Shift & Salary tab
+    if (!isValidTime(formData.shift.start)) newErrors.shiftStart = 'Invalid shift start (HH:mm)';
+    if (!isValidTime(formData.shift.end))   newErrors.shiftEnd   = 'Invalid shift end (HH:mm)';
+
+    if (formData.salaryType === 'hourly') {
+      if (!formData.hourlyRate || parseFloat(formData.hourlyRate) <= 0)
+        newErrors.hourlyRate = 'Hourly rate must be greater than 0';
     }
-    if (!formData.lastName.trim()) {
-      newErrors.lastName = 'Last name is required';
+    // FIX #1: validate monthlySalary when salaryType is monthly
+    if (formData.salaryType === 'monthly') {
+      if (!formData.monthlySalary || parseFloat(formData.monthlySalary) <= 0)
+        newErrors.monthlySalary = 'Monthly salary is required and must be greater than 0';
     }
-    if (!formData.email.trim()) {
-      newErrors.email = 'Email is required';
-    } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formData.email)) {
-      newErrors.email = 'Invalid email format';
-    }
-    if (!formData.employeeNumber.trim()) {
-      newErrors.employeeNumber = 'Employee number is required';
-    }
-    if (!formData.joiningDate) {
-      newErrors.joiningDate = 'Joining date is required';
-    }
-    if (!isValidTime(formData.shift.start)) {
-      newErrors.shiftStart = 'Invalid shift start time (HH:mm format)';
-    }
-    if (!isValidTime(formData.shift.end)) {
-      newErrors.shiftEnd = 'Invalid shift end time (HH:mm format)';
-    }
-    if (formData.hourlyRate <= 0) {
-      newErrors.hourlyRate = 'Hourly rate must be greater than 0';
+
+    // FIX #6: auto-switch to the tab that has the first error
+    if (Object.keys(newErrors).length > 0) {
+      if (newErrors.firstName || newErrors.lastName || newErrors.email ||
+          newErrors.employeeNumber || newErrors.joiningDate) {
+        setActiveTab('basic');
+      } else if (newErrors.shiftStart || newErrors.shiftEnd ||
+                 newErrors.hourlyRate || newErrors.monthlySalary) {
+        setActiveTab('shift');
+      }
     }
 
     setErrors(newErrors);
@@ -102,8 +104,6 @@ export default function AddEmployeeModal({ onClose, onSave }) {
 
   const handleGenerateLink = async (e) => {
     e.preventDefault();
-
-    // Validate form first
     if (!validateForm()) {
       toast.error('Please correct the errors below');
       return;
@@ -112,42 +112,39 @@ export default function AddEmployeeModal({ onClose, onSave }) {
     setLoading(true);
     try {
       const token = localStorage.getItem('token');
-      
-      // Create employee in database
-      const response = await axios.post(
-        '/api/employees',
-        {
-          firstName: formData.firstName,
-          lastName: formData.lastName,
-          email: formData.email,
-          employeeNumber: formData.employeeNumber,
-          department: formData.department,
-          joiningDate: formatToDDMMYYYY(formData.joiningDate), // Convert to dd/mm/yyyy for backend
-          shift: formData.shift,
-          hourlyRate: parseFloat(formData.hourlyRate),
-          bank: formData.bank
-        },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
 
-      // Backend returns employee with inviteLink
+      // FIX #1: send salaryType + monthlySalary to backend
+      const payload = {
+        firstName:      formData.firstName,
+        lastName:       formData.lastName,
+        email:          formData.email,
+        employeeNumber: formData.employeeNumber,
+        department:     formData.department,
+        joiningDate:    formatToDDMMYYYY(formData.joiningDate),
+        shift:          formData.shift,
+        salaryType:     formData.salaryType,
+        hourlyRate:     parseFloat(formData.hourlyRate) || 0,
+        monthlySalary:  formData.salaryType === 'monthly'
+                          ? parseFloat(formData.monthlySalary)
+                          : null,
+        bank: formData.bank
+      };
+
+      const response = await axios.post('/api/employees', payload, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
       const { employee, inviteLink } = response.data;
 
-      // Store for reference
       setNewEmployee(employee);
       setGeneratedLink(inviteLink);
 
-      // Close create dialog
-      onClose();
-
-      // Open link dialog
+      // FIX #4: do NOT call onClose() here — it unmounts this component
+      // before setShowLinkDialog(true) can render the dialog.
+      // onClose() is now called inside handleCloseLinkDialog instead.
       setShowLinkDialog(true);
 
-      // Notify parent
-      if (onSave) {
-        onSave();
-      }
-
+      if (onSave) onSave();
       toast.success('Employee created successfully');
     } catch (error) {
       const errorMsg = error.response?.data?.message || 'Failed to create employee';
@@ -158,16 +155,19 @@ export default function AddEmployeeModal({ onClose, onSave }) {
     }
   };
 
+  // FIX #4: close parent modal AFTER the link dialog is dismissed
   const handleCloseLinkDialog = () => {
     setShowLinkDialog(false);
     setGeneratedLink(null);
     setNewEmployee(null);
+    onClose();
   };
 
   return (
     <>
       <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
         <div className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+
           {/* Header */}
           <div className="sticky top-0 bg-white border-b p-6 flex items-center justify-between">
             <h2 className="text-2xl font-bold text-gray-800">Add New Employee</h2>
@@ -180,7 +180,7 @@ export default function AddEmployeeModal({ onClose, onSave }) {
             </button>
           </div>
 
-          {/* Submit Error Alert */}
+          {/* Submit Error */}
           {errors.submit && (
             <div className="mx-6 mt-6 bg-red-50 border border-red-200 p-4 rounded-lg flex gap-3">
               <AlertCircle className="text-red-600 flex-shrink-0" size={20} />
@@ -191,45 +191,31 @@ export default function AddEmployeeModal({ onClose, onSave }) {
           {/* Tabs */}
           <div className="border-b">
             <div className="flex">
-              <button
-                type="button"
-                onClick={() => setActiveTab('basic')}
-                className={`flex-1 px-4 py-3 font-medium border-b-2 transition ${
-                  activeTab === 'basic'
-                    ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-gray-600 hover:text-gray-800'
-                }`}
-              >
-                Basic Info
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab('shift')}
-                className={`flex-1 px-4 py-3 font-medium border-b-2 transition ${
-                  activeTab === 'shift'
-                    ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-gray-600 hover:text-gray-800'
-                }`}
-              >
-                Shift & Salary
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab('bank')}
-                className={`flex-1 px-4 py-3 font-medium border-b-2 transition ${
-                  activeTab === 'bank'
-                    ? 'border-blue-500 text-blue-600'
-                    : 'border-transparent text-gray-600 hover:text-gray-800'
-                }`}
-              >
-                Bank Details
-              </button>
+              {[
+                { key: 'basic', label: 'Basic Info' },
+                { key: 'shift', label: 'Shift & Salary' },
+                { key: 'bank',  label: 'Bank Details' }
+              ].map(tab => (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => setActiveTab(tab.key)}
+                  className={`flex-1 px-4 py-3 font-medium border-b-2 transition ${
+                    activeTab === tab.key
+                      ? 'border-blue-500 text-blue-600'
+                      : 'border-transparent text-gray-600 hover:text-gray-800'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
             </div>
           </div>
 
-          {/* Content */}
+          {/* Form */}
           <form onSubmit={handleGenerateLink} className="p-6">
-            {/* Basic Info Tab */}
+
+            {/* ── Basic Info Tab ─────────────────────────────────────────── */}
             {activeTab === 'basic' && (
               <div className="space-y-4">
                 <div className="grid grid-cols-2 gap-4">
@@ -243,14 +229,12 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                       value={formData.firstName}
                       onChange={handleInputChange}
                       disabled={loading}
+                      placeholder="John"
                       className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 ${
                         errors.firstName ? 'border-red-500' : 'border-gray-300'
                       }`}
-                      placeholder="John"
                     />
-                    {errors.firstName && (
-                      <p className="text-xs text-red-600 mt-1">{errors.firstName}</p>
-                    )}
+                    {errors.firstName && <p className="text-xs text-red-600 mt-1">{errors.firstName}</p>}
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -262,14 +246,12 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                       value={formData.lastName}
                       onChange={handleInputChange}
                       disabled={loading}
+                      placeholder="Doe"
                       className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 ${
                         errors.lastName ? 'border-red-500' : 'border-gray-300'
                       }`}
-                      placeholder="Doe"
                     />
-                    {errors.lastName && (
-                      <p className="text-xs text-red-600 mt-1">{errors.lastName}</p>
-                    )}
+                    {errors.lastName && <p className="text-xs text-red-600 mt-1">{errors.lastName}</p>}
                   </div>
                 </div>
 
@@ -283,14 +265,12 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                     value={formData.email}
                     onChange={handleInputChange}
                     disabled={loading}
+                    placeholder="john@example.com"
                     className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 ${
                       errors.email ? 'border-red-500' : 'border-gray-300'
                     }`}
-                    placeholder="john@example.com"
                   />
-                  {errors.email && (
-                    <p className="text-xs text-red-600 mt-1">{errors.email}</p>
-                  )}
+                  {errors.email && <p className="text-xs text-red-600 mt-1">{errors.email}</p>}
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
@@ -304,19 +284,18 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                       value={formData.employeeNumber}
                       onChange={handleInputChange}
                       disabled={loading}
+                      placeholder="EMP002"
                       className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 ${
                         errors.employeeNumber ? 'border-red-500' : 'border-gray-300'
                       }`}
-                      placeholder="EMP002"
                     />
-                    {errors.employeeNumber && (
-                      <p className="text-xs text-red-600 mt-1">{errors.employeeNumber}</p>
-                    )}
+                    {errors.employeeNumber && <p className="text-xs text-red-600 mt-1">{errors.employeeNumber}</p>}
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
                       Department <span className="text-red-500">*</span>
                     </label>
+                    {/* FIX #2: added Manager option to match model enum */}
                     <select
                       name="department"
                       value={formData.department}
@@ -326,6 +305,7 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                     >
                       <option value="IT">IT</option>
                       <option value="Customer Support">Customer Support</option>
+                      <option value="Manager">Manager</option>
                       <option value="Marketing">Marketing</option>
                       <option value="HR">HR</option>
                       <option value="Finance">Finance</option>
@@ -337,7 +317,7 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                   <label className="block text-sm font-medium text-gray-700 mb-2">
                     Joining Date <span className="text-red-500">*</span>
                   </label>
-                  <div 
+                  <div
                     className="relative group cursor-pointer"
                     onClick={() => !loading && dateInputRef.current?.showPicker()}
                   >
@@ -351,28 +331,26 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                       className="opacity-0 absolute inset-0 w-full h-full cursor-pointer z-10 disabled:cursor-not-allowed"
                     />
                     <div className={`flex items-center gap-2 px-4 py-2 border rounded-lg bg-white group-hover:border-blue-400 transition-colors ${
-                        errors.joiningDate ? 'border-red-500' : 'border-gray-300'
-                      } ${loading ? 'bg-gray-100' : ''}`}>
+                      errors.joiningDate ? 'border-red-500' : 'border-gray-300'
+                    } ${loading ? 'bg-gray-100' : ''}`}>
                       <Calendar size={18} className="text-gray-400" />
                       <span className="text-gray-700">
                         {formData.joiningDate ? formatToDDMMYYYY(formData.joiningDate) : 'Select Date'}
                       </span>
                     </div>
                   </div>
-                  {errors.joiningDate && (
-                    <p className="text-xs text-red-600 mt-1">{errors.joiningDate}</p>
-                  )}
+                  {errors.joiningDate && <p className="text-xs text-red-600 mt-1">{errors.joiningDate}</p>}
                 </div>
               </div>
             )}
 
-            {/* Shift & Salary Tab */}
+            {/* ── Shift & Salary Tab ─────────────────────────────────────── */}
             {activeTab === 'shift' && (
               <div className="space-y-4">
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Shift Start Time (HH:mm) <span className="text-red-500">*</span>
+                      Shift Start (HH:mm) <span className="text-red-500">*</span>
                     </label>
                     <input
                       type="text"
@@ -385,14 +363,12 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                         errors.shiftStart ? 'border-red-500' : 'border-gray-300'
                       }`}
                     />
-                    {errors.shiftStart && (
-                      <p className="text-xs text-red-600 mt-1">{errors.shiftStart}</p>
-                    )}
+                    {errors.shiftStart && <p className="text-xs text-red-600 mt-1">{errors.shiftStart}</p>}
                     <p className="text-xs text-gray-500 mt-1">24-hour format</p>
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Shift End Time (HH:mm) <span className="text-red-500">*</span>
+                      Shift End (HH:mm) <span className="text-red-500">*</span>
                     </label>
                     <input
                       type="text"
@@ -405,54 +381,110 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                         errors.shiftEnd ? 'border-red-500' : 'border-gray-300'
                       }`}
                     />
-                    {errors.shiftEnd && (
-                      <p className="text-xs text-red-600 mt-1">{errors.shiftEnd}</p>
-                    )}
+                    {errors.shiftEnd && <p className="text-xs text-red-600 mt-1">{errors.shiftEnd}</p>}
                     <p className="text-xs text-gray-500 mt-1">24-hour format</p>
                   </div>
                 </div>
 
+                {/* FIX #1: Salary Type selector */}
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Hourly Rate (PKR) <span className="text-red-500">*</span>
+                    Salary Type <span className="text-red-500">*</span>
                   </label>
-                  <input
-                    type="number"
-                    name="hourlyRate"
-                    value={formData.hourlyRate}
+                  <select
+                    name="salaryType"
+                    value={formData.salaryType}
                     onChange={handleInputChange}
                     disabled={loading}
-                    step="10"
-                    min="0"
-                    className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 ${
-                      errors.hourlyRate ? 'border-red-500' : 'border-gray-300'
-                    }`}
-                  />
-                  {errors.hourlyRate && (
-                    <p className="text-xs text-red-600 mt-1">{errors.hourlyRate}</p>
-                  )}
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+                  >
+                    <option value="hourly">Hourly</option>
+                    <option value="monthly">Monthly</option>
+                  </select>
                 </div>
 
-                {/* Monthly Salary Display */}
+                {/* Hourly Rate — shown for hourly employees */}
+                {formData.salaryType === 'hourly' && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Hourly Rate (PKR) <span className="text-red-500">*</span>
+                    </label>
+                    <input
+                      type="number"
+                      name="hourlyRate"
+                      value={formData.hourlyRate}
+                      onChange={handleInputChange}
+                      disabled={loading}
+                      step="10"
+                      min="0"
+                      className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 ${
+                        errors.hourlyRate ? 'border-red-500' : 'border-gray-300'
+                      }`}
+                    />
+                    {errors.hourlyRate && <p className="text-xs text-red-600 mt-1">{errors.hourlyRate}</p>}
+                  </div>
+                )}
+
+                {/* FIX #1: Monthly Salary — shown for monthly employees */}
+                {formData.salaryType === 'monthly' && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Monthly Salary (PKR) <span className="text-red-500">*</span>
+                    </label>
+                    <input
+                      type="number"
+                      name="monthlySalary"
+                      value={formData.monthlySalary}
+                      onChange={handleInputChange}
+                      disabled={loading}
+                      step="100"
+                      min="0"
+                      placeholder="e.g. 50000"
+                      className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 ${
+                        errors.monthlySalary ? 'border-red-500' : 'border-gray-300'
+                      }`}
+                    />
+                    {errors.monthlySalary && <p className="text-xs text-red-600 mt-1">{errors.monthlySalary}</p>}
+                    <p className="text-xs text-gray-500 mt-1">
+                      An effective hourly rate will be derived automatically for payroll calculations.
+                    </p>
+                  </div>
+                )}
+
+                {/* Salary Preview */}
                 <div className="bg-blue-50 p-4 rounded-lg border border-blue-200">
-                  <p className="text-sm text-gray-600 mb-1">Estimated Monthly Salary:</p>
-                  <p className="text-3xl font-bold text-blue-600">
-                    PKR {calculateMonthlySalary()}
-                  </p>
-                  <p className="text-xs text-gray-600 mt-2">
-                    Based on {formData.shift.start} - {formData.shift.end} shift and PKR {formData.hourlyRate}/hour for 22 working days
-                  </p>
+                  {formData.salaryType === 'hourly' ? (
+                    <>
+                      <p className="text-sm text-gray-600 mb-1">Estimated Monthly Salary:</p>
+                      <p className="text-3xl font-bold text-blue-600">PKR {calculateMonthlySalary()}</p>
+                      <p className="text-xs text-gray-500 mt-2">
+                        Based on {formData.shift.start}–{formData.shift.end} shift × PKR {formData.hourlyRate}/hr × 22 days
+                      </p>
+                      {/* FIX #5: disclaimer that actual pay may differ */}
+                      <p className="text-xs text-amber-600 mt-1">
+                        ⚠️ Estimate only — actual pay depends on working days in the pay period.
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-sm text-gray-600 mb-1">Fixed Monthly Salary:</p>
+                      <p className="text-3xl font-bold text-blue-600">
+                        PKR {formData.monthlySalary ? parseFloat(formData.monthlySalary).toFixed(2) : '0.00'}
+                      </p>
+                      <p className="text-xs text-gray-500 mt-2">
+                        Pro-rated by actual working days attended each pay period.
+                      </p>
+                    </>
+                  )}
                 </div>
               </div>
             )}
 
-            {/* Bank Details Tab */}
+            {/* ── Bank Details Tab ───────────────────────────────────────── */}
             {activeTab === 'bank' && (
               <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Bank Name
-                  </label>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Bank Name</label>
                   <input
                     type="text"
                     name="bank.bankName"
@@ -463,11 +495,8 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                   />
                 </div>
-
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Account Name
-                  </label>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Account Name</label>
                   <input
                     type="text"
                     name="bank.accountName"
@@ -477,11 +506,8 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                   />
                 </div>
-
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Account Number
-                  </label>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Account Number</label>
                   <input
                     type="text"
                     name="bank.accountNumber"
@@ -491,12 +517,11 @@ export default function AddEmployeeModal({ onClose, onSave }) {
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
                   />
                 </div>
-
-                <p className="text-xs text-gray-500">Bank details are optional</p>
+                <p className="text-xs text-gray-500">Bank details are optional and can be added later.</p>
               </div>
             )}
 
-            {/* Buttons */}
+            {/* Action Buttons */}
             <div className="flex gap-4 mt-8 pt-6 border-t">
               <button
                 type="button"
@@ -513,7 +538,7 @@ export default function AddEmployeeModal({ onClose, onSave }) {
               >
                 {loading ? (
                   <>
-                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
                     Creating...
                   </>
                 ) : (
@@ -528,7 +553,7 @@ export default function AddEmployeeModal({ onClose, onSave }) {
         </div>
       </div>
 
-      {/* Link Dialog */}
+      {/* FIX #4: Link dialog rendered here — after parent modal stays mounted */}
       {showLinkDialog && generatedLink && newEmployee && (
         <EmployeeLinkDialog
           employee={newEmployee}

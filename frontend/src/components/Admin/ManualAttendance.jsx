@@ -10,60 +10,55 @@ import { getDateMinusDays, getTodayDate, parseDate } from '../../utils/dateForma
 // ─── Attendance Form Modal (Add & Edit) ──────────────────────────────────────
 function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess }) {
   const isEdit = mode === 'edit';
-  const dateInputRef = useRef(null);
   const hiddenDateRef = useRef(null);
 
   const [form, setForm] = useState({
-    empId:         isEdit ? record?.empId?._id || record?.empId || '' : '',
-    date:          isEdit ? record?.dateFormatted || '' : getTodayDate(),
-    status:        isEdit ? record?.status || 'Present' : 'Present',
-    inTime:        isEdit ? record?.inTime !== '--' ? record?.inTime : '' : '',
-    outTime:       isEdit ? record?.outTime !== '--' ? record?.outTime : '' : '',
+    empId:            isEdit ? (record?.empId?._id || record?.empId || '') : '',
+    date:             isEdit ? (record?.dateFormatted || '') : getTodayDate(),
+    status:           isEdit ? (record?.status || 'Present') : 'Present',
+    inTime:           isEdit ? (record?.inTime  !== '--' ? record?.inTime  : '') : '',
+    outTime:          isEdit ? (record?.outTime !== '--' ? record?.outTime : '') : '',
+    // FIX #1: outNextDay was completely missing from form state and payload
+    outNextDay:       isEdit ? (record?.outNextDay || false) : false,
     deductionDetails: isEdit ? (record?.financials?.deductionDetails || []) : [],
-    otDetails:        isEdit ? (record?.financials?.otDetails || []) : [],
+    otDetails:        isEdit ? (record?.financials?.otDetails        || []) : [],
   });
+
   const [deductionDraft, setDeductionDraft] = useState({ amount: '', reason: '' });
-  const [otDraft, setOtDraft] = useState({ type: 'calc', amount: '', hours: '', rate: '1.5', reason: '' });
-
-  const [employees, setEmployees] = useState([]);
+  const [otDraft, setOtDraft]               = useState({ type: 'calc', amount: '', hours: '', rate: '1.5', reason: '' });
+  const [employees, setEmployees]           = useState([]);
   const [loadingEmployees, setLoadingEmployees] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [saving, setSaving]                 = useState(false);
 
-  // Fetch employees for the dropdown (only needed in Add mode)
+  // Fetch employees for Add mode dropdown
   useEffect(() => {
     if (!isEdit) {
       setLoadingEmployees(true);
       const token = localStorage.getItem('token');
-      axios.get('/api/employees?status=Active', {
-        headers: { Authorization: `Bearer ${token}` }
-      })
-        .then(res => {
-          const list = res.data?.employees || res.data || [];
-          setEmployees(list);
-        })
+      axios.get('/api/employees?status=Active', { headers: { Authorization: `Bearer ${token}` } })
+        .then(res => setEmployees(res.data?.employees || res.data || []))
         .catch(() => toast.error('Failed to load employees'))
         .finally(() => setLoadingEmployees(false));
     }
   }, [isEdit]);
 
   const handleChange = (e) => {
-    const { name, value } = e.target;
-    setForm(prev => ({ ...prev, [name]: value }));
+    const { name, value, type, checked } = e.target;
+    // FIX #1: handle checkbox type for outNextDay
+    setForm(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
   };
 
   const handleHiddenDateChange = (e) => {
-    const val = e.target.value; // yyyy-mm-dd
+    const val = e.target.value;
     if (!val) return;
     const [y, m, d] = val.split('-');
-    const formatted = `${d}/${m}/${y}`;
-    setForm(prev => ({ ...prev, date: formatted }));
+    setForm(prev => ({ ...prev, date: `${d}/${m}/${y}` }));
   };
 
   const addDeduction = () => {
     const amount = parseFloat(deductionDraft.amount);
-    if (!amount || amount < 0) return toast.error('Enter a valid deduction amount');
+    if (!amount || amount < 0)         return toast.error('Enter a valid deduction amount');
     if (!deductionDraft.reason.trim()) return toast.error('Deduction reason is required');
-
     setForm(prev => ({
       ...prev,
       deductionDetails: [...prev.deductionDetails, { amount, reason: deductionDraft.reason.trim() }]
@@ -73,122 +68,79 @@ function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess }
 
   const addOT = () => {
     if (!otDraft.reason.trim()) return toast.error('OT reason is required');
-
     if (otDraft.type === 'manual') {
       const amount = parseFloat(otDraft.amount);
       if (!amount || amount < 0) return toast.error('Enter a valid OT amount');
-      setForm(prev => ({
-        ...prev,
-        otDetails: [...prev.otDetails, { type: 'manual', amount, reason: otDraft.reason.trim() }]
-      }));
+      setForm(prev => ({ ...prev, otDetails: [...prev.otDetails, { type: 'manual', amount, reason: otDraft.reason.trim() }] }));
     } else {
       const hours = parseFloat(otDraft.hours);
-      const rate = parseFloat(otDraft.rate) || 1;
+      const rate  = parseFloat(otDraft.rate) || 1;
       if (!hours || hours <= 0) return toast.error('Enter valid OT hours');
-      setForm(prev => ({
-        ...prev,
-        otDetails: [...prev.otDetails, { type: 'calc', hours, rate, reason: otDraft.reason.trim() }]
-      }));
+      setForm(prev => ({ ...prev, otDetails: [...prev.otDetails, { type: 'calc', hours, rate, reason: otDraft.reason.trim() }] }));
     }
-
     setOtDraft({ type: 'calc', amount: '', hours: '', rate: '1.5', reason: '' });
   };
 
-  const removeDetail = (key, index) => {
-    setForm(prev => ({ ...prev, [key]: prev[key].filter((_, idx) => idx !== index) }));
-  };
-
-  const handleCalendarClick = () => {
-    if (hiddenDateRef.current) {
-      try {
-        hiddenDateRef.current.showPicker();
-      } catch (err) {
-        hiddenDateRef.current.focus();
-      }
-    }
-  };
+  const removeDetail = (key, index) =>
+    setForm(prev => ({ ...prev, [key]: prev[key].filter((_, i) => i !== index) }));
 
   const handleSubmit = async () => {
-    // Basic validation
-    if (!isEdit && !form.empId) {
-      toast.error('Please select an employee');
-      return;
-    }
-    if (!form.date) {
-      toast.error('Please enter a date');
-      return;
-    }
-    if (!form.status) {
-      toast.error('Please select a status');
-      return;
-    }
+    if (!isEdit && !form.empId) return toast.error('Please select an employee');
+    if (!form.date)             return toast.error('Please enter a date');
+    if (!form.status)           return toast.error('Please select a status');
 
     setSaving(true);
     try {
       const token = localStorage.getItem('token');
       const payload = {
-        empId:         isEdit ? (record?.empId?._id || record?.empId) : form.empId,
-        date:          form.date,
-        status:        form.status,
-        inTime:        form.inTime || null,
-        outTime:       form.outTime || null,
+        empId:            isEdit ? (record?.empId?._id || record?.empId) : form.empId,
+        date:             form.date,
+        status:           form.status,
+        inTime:           form.inTime  || null,
+        outTime:          form.outTime || null,
+        // FIX #1: send outNextDay — backend save-row uses this for night-shift hour calculation
+        outNextDay:       form.outNextDay || false,
         deductionDetails: form.deductionDetails,
-        otDetails: form.otDetails,
+        otDetails:        form.otDetails,
       };
 
       await axios.post('/api/attendance/save-row', payload, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        }
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
       });
 
       toast.success(isEdit ? 'Attendance updated successfully' : 'Attendance added successfully');
       onSuccess();
       onClose();
     } catch (err) {
-      const msg = err.response?.data?.message || 'Failed to save attendance';
-      toast.error(msg);
+      toast.error(err.response?.data?.message || 'Failed to save attendance');
     } finally {
       setSaving(false);
     }
   };
 
-  // Determine which fields to show based on status
   const showTimes = ['Present', 'Late'].includes(form.status);
-  const showFinancials = true;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col">
 
-        {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b">
           <h2 className="text-lg font-bold text-gray-800">
             {isEdit ? 'Edit Attendance Record' : 'Add Attendance Record'}
           </h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition">
-            <X size={20} />
-          </button>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition"><X size={20} /></button>
         </div>
 
-        {/* Body */}
-          <div className="px-6 py-5 space-y-4 overflow-auto flex-1">
+        <div className="px-6 py-5 space-y-4 overflow-auto flex-1">
 
-
-          {/* Employee — only in Add mode */}
           {!isEdit && (
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Employee *</label>
               {loadingEmployees ? (
                 <p className="text-sm text-gray-400">Loading employees...</p>
               ) : (
-                <select
-                  name="empId"
-                  value={form.empId}
-                  onChange={handleChange}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                >
+                <select name="empId" value={form.empId} onChange={handleChange}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500">
                   <option value="">-- Select Employee --</option>
                   {employees.map(emp => (
                     <option key={emp._id} value={emp._id}>
@@ -200,7 +152,6 @@ function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess }
             </div>
           )}
 
-          {/* Employee info display — Edit mode */}
           {isEdit && (
             <div className="bg-blue-50 rounded-lg px-4 py-3">
               <p className="text-sm font-semibold text-blue-800">{record?.empName}</p>
@@ -208,44 +159,24 @@ function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess }
             </div>
           )}
 
-          {/* Date */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Date * (dd/mm/yyyy)</label>
             <div className="relative">
-              <input
-                ref={dateInputRef}
-                type="text"
-                name="date"
-                value={form.date}
-                onChange={handleChange}
-                placeholder="dd/mm/yyyy"
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              />
-              <input 
-                type="date"
-                ref={hiddenDateRef}
-                className="absolute opacity-0 pointer-events-none"
-                onChange={handleHiddenDateChange}
-              />
-              <button 
-                type="button"
-                onClick={handleCalendarClick}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-blue-500"
-              >
+              <input type="text" name="date" value={form.date} onChange={handleChange} placeholder="dd/mm/yyyy"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 pr-10" />
+              <input type="date" ref={hiddenDateRef} className="absolute opacity-0 pointer-events-none"
+                onChange={handleHiddenDateChange} />
+              <button type="button" onClick={() => { try { hiddenDateRef.current?.showPicker(); } catch { hiddenDateRef.current?.focus(); } }}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-blue-500">
                 <Calendar size={16} />
               </button>
             </div>
           </div>
 
-          {/* Status */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Status *</label>
-            <select
-              name="status"
-              value={form.status}
-              onChange={handleChange}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-            >
+            <select name="status" value={form.status} onChange={handleChange}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500">
               <option value="Present">Present</option>
               <option value="Late">Late</option>
               <option value="Absent">Absent</option>
@@ -253,105 +184,104 @@ function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess }
             </select>
           </div>
 
-          {/* In / Out Times */}
           {showTimes && (
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">In Time (HH:mm)</label>
-                <input
-                  type="text"
-                  name="inTime"
-                  value={form.inTime}
-                  onChange={handleChange}
-                  placeholder="09:00"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Out Time (HH:mm)</label>
-                <input
-                  type="text"
-                  name="outTime"
-                  value={form.outTime}
-                  onChange={handleChange}
-                  placeholder="17:00"
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-            </div>
-          )}
-
-          {/* OT & Deduction */}
-          {showFinancials && (
             <>
-              <div className="border rounded-lg p-3 bg-gray-50 space-y-2">
-                <p className="text-sm font-semibold text-gray-700">Deductions</p>
-                <div className="grid grid-cols-2 gap-2">
-                  <input type="number" min="0" placeholder="Amount" value={deductionDraft.amount} onChange={(e) => setDeductionDraft(prev => ({ ...prev, amount: e.target.value }))} className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
-                  <input type="text" placeholder="Reason" value={deductionDraft.reason} onChange={(e) => setDeductionDraft(prev => ({ ...prev, reason: e.target.value }))} className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">In Time (HH:mm)</label>
+                  <input type="text" name="inTime" value={form.inTime} onChange={handleChange} placeholder="09:00"
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500" />
                 </div>
-                <button type="button" onClick={addDeduction} className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg">
-                  <Plus size={12} /> Add Deduction
-                </button>
-                <div className="space-y-1">
-                  {form.deductionDetails.map((entry, idx) => (
-                    <div key={`d-${idx}`} className="flex justify-between text-xs bg-white border rounded px-2 py-1">
-                      <span>PKR {entry.amount} - {entry.reason}</span>
-                      <button type="button" onClick={() => removeDetail('deductionDetails', idx)} className="text-red-600">Remove</button>
-                    </div>
-                  ))}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Out Time (HH:mm)</label>
+                  <input type="text" name="outTime" value={form.outTime} onChange={handleChange} placeholder="17:00"
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500" />
                 </div>
               </div>
-
-              <div className="border rounded-lg p-3 bg-gray-50 space-y-2">
-                <p className="text-sm font-semibold text-gray-700">Overtime (OT)</p>
-                <div className="grid grid-cols-2 gap-2">
-                  <select value={otDraft.type} onChange={(e) => setOtDraft(prev => ({ ...prev, type: e.target.value }))} className="border border-gray-300 rounded-lg px-3 py-2 text-sm">
-                    <option value="calc">Calculated</option>
-                    <option value="manual">Manual Amount</option>
-                  </select>
-                  <input type="text" placeholder="Reason" value={otDraft.reason} onChange={(e) => setOtDraft(prev => ({ ...prev, reason: e.target.value }))} className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
-                  {otDraft.type === 'manual' ? (
-                    <input type="number" min="0" placeholder="Amount" value={otDraft.amount} onChange={(e) => setOtDraft(prev => ({ ...prev, amount: e.target.value }))} className="border border-gray-300 rounded-lg px-3 py-2 text-sm col-span-2" />
-                  ) : (
-                    <>
-                      <input type="number" min="0" step="0.5" placeholder="Hours" value={otDraft.hours} onChange={(e) => setOtDraft(prev => ({ ...prev, hours: e.target.value }))} className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
-                      <select value={otDraft.rate} onChange={(e) => setOtDraft(prev => ({ ...prev, rate: e.target.value }))} className="border border-gray-300 rounded-lg px-3 py-2 text-sm">
-                        <option value="1">1.0x</option><option value="1.5">1.5x</option><option value="2">2.0x</option>
-                      </select>
-                    </>
-                  )}
-                </div>
-                <button type="button" onClick={addOT} className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-lg">
-                  <Plus size={12} /> Add OT
-                </button>
-                <div className="space-y-1">
-                  {form.otDetails.map((entry, idx) => (
-                    <div key={`ot-${idx}`} className="flex justify-between text-xs bg-white border rounded px-2 py-1">
-                      <span>{entry.type === 'manual' ? `PKR ${entry.amount}` : `${entry.hours}h x ${entry.rate}x`} - {entry.reason}</span>
-                      <button type="button" onClick={() => removeDetail('otDetails', idx)} className="text-red-600">Remove</button>
-                    </div>
-                  ))}
-                </div>
-              </div>
+              {/* FIX #1: outNextDay checkbox — was entirely missing from the form */}
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none">
+                <input type="checkbox" name="outNextDay" checked={form.outNextDay} onChange={handleChange}
+                  className="w-4 h-4 rounded border-gray-300" />
+                Out time is next calendar day (night shift)
+              </label>
             </>
           )}
+
+          {/* Deductions */}
+          <div className="border rounded-lg p-3 bg-gray-50 space-y-2">
+            <p className="text-sm font-semibold text-gray-700">Deductions</p>
+            <div className="grid grid-cols-2 gap-2">
+              <input type="number" min="0" placeholder="Amount" value={deductionDraft.amount}
+                onChange={e => setDeductionDraft(prev => ({ ...prev, amount: e.target.value }))}
+                className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+              <input type="text" placeholder="Reason" value={deductionDraft.reason}
+                onChange={e => setDeductionDraft(prev => ({ ...prev, reason: e.target.value }))}
+                className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+            </div>
+            <button type="button" onClick={addDeduction}
+              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-lg">
+              <Plus size={12} /> Add Deduction
+            </button>
+            <div className="space-y-1">
+              {form.deductionDetails.map((entry, idx) => (
+                <div key={`d-${idx}`} className="flex justify-between text-xs bg-white border rounded px-2 py-1">
+                  <span>PKR {entry.amount} - {entry.reason}</span>
+                  <button type="button" onClick={() => removeDetail('deductionDetails', idx)} className="text-red-600 hover:text-red-800">Remove</button>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* OT */}
+          <div className="border rounded-lg p-3 bg-gray-50 space-y-2">
+            <p className="text-sm font-semibold text-gray-700">Overtime (OT)</p>
+            <div className="grid grid-cols-2 gap-2">
+              <select value={otDraft.type} onChange={e => setOtDraft(prev => ({ ...prev, type: e.target.value }))}
+                className="border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                <option value="calc">Calculated</option>
+                <option value="manual">Manual Amount</option>
+              </select>
+              <input type="text" placeholder="Reason" value={otDraft.reason}
+                onChange={e => setOtDraft(prev => ({ ...prev, reason: e.target.value }))}
+                className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+              {otDraft.type === 'manual' ? (
+                <input type="number" min="0" placeholder="Amount" value={otDraft.amount}
+                  onChange={e => setOtDraft(prev => ({ ...prev, amount: e.target.value }))}
+                  className="border border-gray-300 rounded-lg px-3 py-2 text-sm col-span-2" />
+              ) : (
+                <>
+                  <input type="number" min="0" step="0.5" placeholder="Hours" value={otDraft.hours}
+                    onChange={e => setOtDraft(prev => ({ ...prev, hours: e.target.value }))}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm" />
+                  <select value={otDraft.rate} onChange={e => setOtDraft(prev => ({ ...prev, rate: e.target.value }))}
+                    className="border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                    <option value="1">1.0x</option><option value="1.5">1.5x</option><option value="2">2.0x</option>
+                  </select>
+                </>
+              )}
+            </div>
+            <button type="button" onClick={addOT}
+              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-lg">
+              <Plus size={12} /> Add OT
+            </button>
+            <div className="space-y-1">
+              {form.otDetails.map((entry, idx) => (
+                <div key={`ot-${idx}`} className="flex justify-between text-xs bg-white border rounded px-2 py-1">
+                  <span>{entry.type === 'manual' ? `PKR ${entry.amount}` : `${entry.hours}h x ${entry.rate}x`} - {entry.reason}</span>
+                  <button type="button" onClick={() => removeDetail('otDetails', idx)} className="text-red-600 hover:text-red-800">Remove</button>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
 
-        {/* Footer */}
-  <div className="flex justify-end gap-3 px-6 py-4 border-t bg-gray-50 rounded-b-2xl">
-          <button
-            onClick={onClose}
-            disabled={saving}
-            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition disabled:opacity-50"
-          >
+        <div className="flex justify-end gap-3 px-6 py-4 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} disabled={saving}
+            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition disabled:opacity-50">
             Cancel
           </button>
-          <button
-            onClick={handleSubmit}
-            disabled={saving}
-            className="flex items-center gap-2 px-5 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition disabled:opacity-50"
-          >
+          <button onClick={handleSubmit} disabled={saving}
+            className="flex items-center gap-2 px-5 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition disabled:opacity-50">
             <Save size={15} />
             {saving ? 'Saving...' : isEdit ? 'Update' : 'Add Record'}
           </button>
@@ -364,26 +294,28 @@ function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function ManualAttendance() {
-  const [attendance, setAttendance]       = useState([]);
-  const [loading, setLoading]             = useState(false);
-  const [fromDate, setFromDate]           = useState(getDateMinusDays(30));
-  const [toDate, setToDate]               = useState(getTodayDate());
+  const [attendance,      setAttendance]      = useState([]);
+  const [loading,         setLoading]         = useState(false);
+  const [fromDate,        setFromDate]        = useState(getDateMinusDays(30));
+  const [toDate,          setToDate]          = useState(getTodayDate());
   const [showImportModal, setShowImportModal] = useState(false);
-  const [refreshing, setRefreshing]       = useState(false);
-  const [isMobile, setIsMobile]           = useState(window.innerWidth < 768);
+  const [refreshing,      setRefreshing]      = useState(false);
+  // FIX #2: avoid window access during SSR/initial render
+  const [isMobile,        setIsMobile]        = useState(false);
 
   const hiddenFromDateRef = useRef(null);
-  const hiddenToDateRef = useRef(null);
+  const hiddenToDateRef   = useRef(null);
 
-  // Modal state
-  const [showAddModal, setShowAddModal]   = useState(false);
-  const [editRecord, setEditRecord]       = useState(null); // null = closed
-  const [detailsModal, setDetailsModal]   = useState(null);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [editRecord,   setEditRecord]   = useState(null);
+  const [detailsModal, setDetailsModal] = useState(null);
 
   const userRole = localStorage.getItem('role');
   const isAdmin  = userRole === 'admin';
 
   useEffect(() => {
+    // FIX #2: safely read window after mount
+    setIsMobile(window.innerWidth < 768);
     const handleResize = () => setIsMobile(window.innerWidth < 768);
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
@@ -397,12 +329,11 @@ export default function ManualAttendance() {
 
       const response = await axios.get(
         `/api/attendance/range?fromDate=${fromDate}&toDate=${toDate}`,
-        { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+        { headers: { Authorization: `Bearer ${token}` } }
       );
-
       setAttendance(response.data?.attendance || []);
     } catch (error) {
-      if (error.response?.status === 401)      toast.error('Unauthorized. Please login again.');
+      if      (error.response?.status === 401) toast.error('Unauthorized. Please login again.');
       else if (error.response?.status === 403) toast.error('You do not have permission to access this page.');
       else                                     toast.error('Failed to load attendance data');
       setAttendance([]);
@@ -416,41 +347,18 @@ export default function ManualAttendance() {
   const handleDateRangeChange = () => {
     const from = parseDate(fromDate);
     const to   = parseDate(toDate);
-
-    if (!from || !to) {
-      toast.error('Invalid date format. Use dd/mm/yyyy');
-      return;
-    }
-
-    if (from > to) {
-      toast.error('From date cannot be after to date');
-      return;
-    }
-
+    if (!from || !to) { toast.error('Invalid date format. Use dd/mm/yyyy'); return; }
+    if (from > to)    { toast.error('From date cannot be after to date'); return; }
     fetchAttendance();
   };
 
   const handleImportSuccess = () => {
     setRefreshing(true);
-    setTimeout(() => {
-      fetchAttendance();
-      setRefreshing(false);
-      toast.success('Attendance list updated');
-    }, 1500);
-  };
-
-  const handleFormSuccess = () => {
-    fetchAttendance();
+    setTimeout(() => { fetchAttendance(); setRefreshing(false); }, 1500);
   };
 
   const handleShowPicker = (ref) => {
-    if (ref.current) {
-      try {
-        ref.current.showPicker();
-      } catch (err) {
-        ref.current.focus();
-      }
-    }
+    try { ref.current?.showPicker(); } catch { ref.current?.focus(); }
   };
 
   const handleHiddenDateChange = (e, setter) => {
@@ -461,25 +369,27 @@ export default function ManualAttendance() {
   };
 
   const handleExport = () => {
-    if (attendance.length === 0) { toast.error('No attendance data to export'); return; }
+    if (!attendance.length) { toast.error('No attendance data to export'); return; }
 
     const csv = [
-      ['Date','Employee ID','Name','Department','Status','In Time','Out Time','Hours Worked','OT Amount','Total Deduction','Daily Earning','Last Modified'].join(',')
+      ['Date','Employee ID','Name','Department','Status','In Time','Out Time',
+       'Hours Worked','OT Amount','Total Deduction','Daily Earning','Last Modified'].join(',')
     ];
     attendance.forEach(record => {
       csv.push([
-        record.dateFormatted || '--',
-        record.empNumber     || '--',
-        record.empName       || '--',
-        record.department    || '--',
-        record.status        || '--',
-        record.inTime        || '--',
-        record.outTime       || '--',
-        (record.financials?.hoursPerDay?.toFixed(2))    || '0.00',
-        (record.financials?.otAmount?.toFixed(2)) || '0.00',
-        (record.financials?.deduction?.toFixed(2)) || '0.00',
+        record.dateFormatted                              || '--',
+        record.empNumber                                  || '--',
+        record.empName                                    || '--',
+        record.department                                 || '--',
+        record.status                                     || '--',
+        record.inTime                                     || '--',
+        record.outTime                                    || '--',
+        // FIX #3: hoursPerDay → hoursWorked (matches AttendanceLog financials schema)
+        (record.financials?.hoursWorked?.toFixed(2))     || '0.00',
+        (record.financials?.otAmount?.toFixed(2))        || '0.00',
+        (record.financials?.deduction?.toFixed(2))       || '0.00',
         (record.financials?.finalDayEarning?.toFixed(2)) || '0.00',
-        record.lastModified  || '--'
+        record.lastModified                              || '--'
       ].map(v => `"${v}"`).join(','));
     });
 
@@ -501,143 +411,83 @@ export default function ManualAttendance() {
     }
   };
 
-
   return (
     <div className="p-4 md:p-6">
 
-      {/* ── Header ── */}
+      {/* Header */}
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6">
         <h1 className="text-2xl md:text-3xl font-bold text-gray-800">Manual Attendance</h1>
-
         <div className="flex gap-2 w-full md:w-auto flex-wrap">
           {isAdmin && (
             <>
-              {/* Add Record */}
-              <button
-                onClick={() => setShowAddModal(true)}
-                disabled={loading}
-                className="flex items-center gap-2 px-3 md:px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 text-sm md:text-base"
-                title="Add attendance record manually"
-              >
-                <Plus size={18} />
-                <span className="hidden sm:inline">Add Record</span>
+              <button onClick={() => setShowAddModal(true)} disabled={loading}
+                className="flex items-center gap-2 px-3 md:px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition disabled:opacity-50 text-sm">
+                <Plus size={18} /><span className="hidden sm:inline">Add Record</span>
               </button>
-
-              {/* Import CSV */}
-              <button
-                onClick={() => setShowImportModal(true)}
-                disabled={loading || refreshing}
-                className="flex items-center gap-2 px-3 md:px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition disabled:opacity-50 text-sm md:text-base"
-                title="Import CSV file"
-              >
-                <Upload size={18} />
-                <span className="hidden sm:inline">Import CSV</span>
+              <button onClick={() => setShowImportModal(true)} disabled={loading || refreshing}
+                className="flex items-center gap-2 px-3 md:px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition disabled:opacity-50 text-sm">
+                <Upload size={18} /><span className="hidden sm:inline">Import CSV</span>
               </button>
             </>
           )}
-
-          {/* Export */}
-          <button
-            onClick={handleExport}
-            disabled={loading || attendance.length === 0}
-            className="flex items-center gap-2 px-3 md:px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50 text-sm md:text-base"
-            title="Export attendance"
-          >
-            <Download size={18} />
-            <span className="hidden sm:inline">Export</span>
+          <button onClick={handleExport} disabled={loading || !attendance.length}
+            className="flex items-center gap-2 px-3 md:px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50 text-sm">
+            <Download size={18} /><span className="hidden sm:inline">Export</span>
           </button>
-
-          {/* Refresh */}
-          <button
-            onClick={() => { setRefreshing(true); fetchAttendance().then(() => setRefreshing(false)); }}
+          <button onClick={() => { setRefreshing(true); fetchAttendance().finally(() => setRefreshing(false)); }}
             disabled={loading || refreshing}
-            className="flex items-center gap-2 px-3 md:px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition disabled:opacity-50 text-sm md:text-base"
-            title="Refresh data"
-          >
+            className="flex items-center gap-2 px-3 md:px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition disabled:opacity-50 text-sm">
             <RefreshCw size={18} className={refreshing ? 'animate-spin' : ''} />
           </button>
         </div>
       </div>
 
-      {/* ── Date Range Filter ── */}
+      {/* Date Range Filter */}
       <div className="bg-white rounded-lg shadow p-4 md:p-6 mb-6">
         <div className="grid grid-cols-1 md:grid-cols-5 gap-3 md:gap-4">
           <div>
-            <label className="block text-xs md:text-sm font-medium text-gray-700 mb-1 md:mb-2">
-              From Date (dd/mm/yyyy)
-            </label>
+            <label className="block text-xs md:text-sm font-medium text-gray-700 mb-1 md:mb-2">From Date (dd/mm/yyyy)</label>
             <div className="relative">
-              <input
-                type="text"
-                value={fromDate}
-                onChange={e => setFromDate(e.target.value)}
-                placeholder="dd/mm/yyyy"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm"
-              />
-              <input 
-                type="date"
-                ref={hiddenFromDateRef}
-                className="absolute opacity-0 pointer-events-none"
-                onChange={(e) => handleHiddenDateChange(e, setFromDate)}
-              />
-              <button 
-                type="button"
-                onClick={() => handleShowPicker(hiddenFromDateRef)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-blue-500"
-              >
+              <input type="text" value={fromDate} onChange={e => setFromDate(e.target.value)} placeholder="dd/mm/yyyy"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm pr-8" />
+              <input type="date" ref={hiddenFromDateRef} className="absolute opacity-0 pointer-events-none"
+                onChange={e => handleHiddenDateChange(e, setFromDate)} />
+              <button type="button" onClick={() => handleShowPicker(hiddenFromDateRef)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-blue-500">
                 <Calendar size={14} />
               </button>
             </div>
           </div>
           <div>
-            <label className="block text-xs md:text-sm font-medium text-gray-700 mb-1 md:mb-2">
-              To Date (dd/mm/yyyy)
-            </label>
+            <label className="block text-xs md:text-sm font-medium text-gray-700 mb-1 md:mb-2">To Date (dd/mm/yyyy)</label>
             <div className="relative">
-              <input
-                type="text"
-                value={toDate}
-                onChange={e => setToDate(e.target.value)}
-                placeholder="dd/mm/yyyy"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm"
-              />
-              <input 
-                type="date"
-                ref={hiddenToDateRef}
-                className="absolute opacity-0 pointer-events-none"
-                onChange={(e) => handleHiddenDateChange(e, setToDate)}
-              />
-              <button 
-                type="button"
-                onClick={() => handleShowPicker(hiddenToDateRef)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-blue-500"
-              >
+              <input type="text" value={toDate} onChange={e => setToDate(e.target.value)} placeholder="dd/mm/yyyy"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm pr-8" />
+              <input type="date" ref={hiddenToDateRef} className="absolute opacity-0 pointer-events-none"
+                onChange={e => handleHiddenDateChange(e, setToDate)} />
+              <button type="button" onClick={() => handleShowPicker(hiddenToDateRef)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-blue-500">
                 <Calendar size={14} />
               </button>
             </div>
           </div>
           <div className="flex items-end">
-            <button
-              onClick={handleDateRangeChange}
-              disabled={loading}
-              className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50 text-sm font-medium"
-            >
+            <button onClick={handleDateRangeChange} disabled={loading}
+              className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50 text-sm font-medium">
               {loading ? 'Loading...' : 'Apply'}
             </button>
           </div>
           <div className="flex items-end md:col-span-2">
-            <div className="w-full text-xs text-gray-600 p-2 bg-gray-50 rounded">
-              Total Records: {attendance.length}
-            </div>
+            <div className="w-full text-xs text-gray-600 p-2 bg-gray-50 rounded">Total Records: {attendance.length}</div>
           </div>
         </div>
       </div>
 
-      {/* ── Attendance Table ── */}
+      {/* Attendance Table */}
       <div className="bg-white rounded-lg shadow overflow-hidden">
         {loading && !attendance.length ? (
           <div className="p-12 text-center">
-            <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mb-4"></div>
+            <div className="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mb-4" />
             <p className="text-gray-600 font-medium">Loading attendance data...</p>
           </div>
         ) : attendance.length === 0 ? (
@@ -647,7 +497,7 @@ export default function ManualAttendance() {
           </div>
         ) : (
           <>
-            {/* Desktop View */}
+            {/* Desktop */}
             <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-gray-100 border-b">
@@ -669,7 +519,7 @@ export default function ManualAttendance() {
                 </thead>
                 <tbody className="divide-y">
                   {attendance.map((record, idx) => (
-                    <tr key={idx} className="hover:bg-gray-50">
+                    <tr key={record._id || idx} className="hover:bg-gray-50">
                       <td className="px-4 py-3">{record.dateFormatted}</td>
                       <td className="px-4 py-3 font-medium">{record.empNumber}</td>
                       <td className="px-4 py-3">{record.empName}</td>
@@ -680,15 +530,22 @@ export default function ManualAttendance() {
                         </span>
                       </td>
                       <td className="px-4 py-3 text-center">{record.inTime}</td>
-                      <td className="px-4 py-3 text-center">{record.outTime}</td>
-                      <td className="px-4 py-3 text-right">{(record.financials?.hoursPerDay || 0).toFixed(2)}</td>
+                      <td className="px-4 py-3 text-center">
+                        {record.outTime}
+                        {/* FIX #1: surface outNextDay indicator */}
+                        {record.outNextDay && <span className="ml-1 text-xs text-orange-500 font-medium">(+1)</span>}
+                      </td>
+                      {/* FIX #3: hoursPerDay → hoursWorked */}
+                      <td className="px-4 py-3 text-right">{(record.financials?.hoursWorked || 0).toFixed(2)}</td>
                       <td className="px-4 py-3 text-right">
-                        <button type="button" onClick={() => setDetailsModal({ type: "ot", record })} className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900">
+                        <button type="button" onClick={() => setDetailsModal({ type: 'ot', record })}
+                          className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-900">
                           PKR {(record.financials?.otAmount || 0).toFixed(2)} <Eye size={12} />
                         </button>
                       </td>
                       <td className="px-4 py-3 text-right">
-                        <button type="button" onClick={() => setDetailsModal({ type: "deduction", record })} className="inline-flex items-center gap-1 text-red-700 hover:text-red-900">
+                        <button type="button" onClick={() => setDetailsModal({ type: 'deduction', record })}
+                          className="inline-flex items-center gap-1 text-red-700 hover:text-red-900">
                           PKR {(record.financials?.deduction || 0).toFixed(2)} <Eye size={12} />
                         </button>
                       </td>
@@ -698,13 +555,9 @@ export default function ManualAttendance() {
                       <td className="px-4 py-3 text-xs text-gray-600">{record.lastModified}</td>
                       {isAdmin && (
                         <td className="px-4 py-3 text-center">
-                          <button
-                            onClick={() => setEditRecord(record)}
-                            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition"
-                            title="Edit record"
-                          >
-                            <Pencil size={13} />
-                            Edit
+                          <button onClick={() => setEditRecord(record)}
+                            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition">
+                            <Pencil size={13} /> Edit
                           </button>
                         </td>
                       )}
@@ -714,10 +567,10 @@ export default function ManualAttendance() {
               </table>
             </div>
 
-            {/* Mobile View */}
+            {/* Mobile */}
             <div className="md:hidden space-y-3 p-4">
               {attendance.map((record, idx) => (
-                <div key={idx} className="border rounded-lg p-4 bg-gray-50">
+                <div key={record._id || idx} className="border rounded-lg p-4 bg-gray-50">
                   <div className="flex justify-between items-start mb-2">
                     <div>
                       <p className="font-semibold text-gray-900">{record.empName}</p>
@@ -728,28 +581,26 @@ export default function ManualAttendance() {
                         {record.status}
                       </span>
                       {isAdmin && (
-                        <button
-                          onClick={() => setEditRecord(record)}
-                          className="p-1.5 text-indigo-600 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition"
-                          title="Edit record"
-                        >
+                        <button onClick={() => setEditRecord(record)}
+                          className="p-1.5 text-indigo-600 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition">
                           <Pencil size={13} />
                         </button>
                       )}
                     </div>
                   </div>
-
                   <div className="space-y-1 text-sm">
                     <p><span className="font-medium">Date:</span> {record.dateFormatted}</p>
                     <p><span className="font-medium">Dept:</span> {record.department}</p>
-                    <p><span className="font-medium">In/Out:</span> {record.inTime} - {record.outTime}</p>
-                    <p><span className="font-medium">Hours:</span> {(record.financials?.hoursPerDay || 0).toFixed(2)}</p>
+                    <p>
+                      <span className="font-medium">In/Out:</span> {record.inTime} - {record.outTime}
+                      {record.outNextDay && <span className="ml-1 text-xs text-orange-500">(+1 day)</span>}
+                    </p>
+                    {/* FIX #3: hoursPerDay → hoursWorked */}
+                    <p><span className="font-medium">Hours:</span> {(record.financials?.hoursWorked || 0).toFixed(2)}</p>
                     <p><span className="font-medium">OT:</span> PKR {(record.financials?.otAmount || 0).toFixed(2)}</p>
                     <p><span className="font-medium">Deduction:</span> PKR {(record.financials?.deduction || 0).toFixed(2)}</p>
                     <p><span className="font-medium">Earning:</span> PKR {(record.financials?.finalDayEarning || 0).toFixed(2)}</p>
-                    <p className="text-xs text-gray-500">
-                      <span className="font-medium">Modified:</span> {record.lastModified}
-                    </p>
+                    <p className="text-xs text-gray-500"><span className="font-medium">Modified:</span> {record.lastModified}</p>
                   </div>
                 </div>
               ))}
@@ -758,52 +609,47 @@ export default function ManualAttendance() {
         )}
       </div>
 
-      {/* ── Modals ── */}
+      {/* Modals */}
       {showImportModal && (
-        <CSVImportModal
-          onClose={() => setShowImportModal(false)}
-          onSuccess={handleImportSuccess}
-        />
+        <CSVImportModal onClose={() => setShowImportModal(false)} onSuccess={handleImportSuccess} />
       )}
-
       {showAddModal && (
-        <AttendanceFormModal
-          mode="add"
+        <AttendanceFormModal mode="add"
           onClose={() => setShowAddModal(false)}
-          onSuccess={handleFormSuccess}
-        />
+          onSuccess={fetchAttendance} />
       )}
-
       {editRecord && (
-        <AttendanceFormModal
-          mode="edit"
-          record={editRecord}
+        <AttendanceFormModal mode="edit" record={editRecord}
           onClose={() => setEditRecord(null)}
-          onSuccess={handleFormSuccess}
-        />
+          onSuccess={fetchAttendance} />
       )}
 
+      {/* OT / Deduction detail popup */}
       {detailsModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
           <div className="bg-white rounded-xl shadow-2xl w-full max-w-md">
             <div className="flex items-center justify-between px-5 py-3 border-b">
-              <h3 className="font-semibold text-gray-800">{detailsModal.type === 'ot' ? 'OT Details' : 'Deduction Details'} - {detailsModal.record.empName}</h3>
+              <h3 className="font-semibold text-gray-800">
+                {detailsModal.type === 'ot' ? 'OT Details' : 'Deduction Details'} — {detailsModal.record.empName}
+              </h3>
               <button onClick={() => setDetailsModal(null)} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
             </div>
             <div className="p-4 space-y-2 max-h-80 overflow-auto">
-              {(detailsModal.type === 'ot' ? detailsModal.record.financials?.otDetails : detailsModal.record.financials?.deductionDetails)?.length ? (
-                (detailsModal.type === 'ot' ? detailsModal.record.financials?.otDetails : detailsModal.record.financials?.deductionDetails).map((entry, idx) => (
-                  <div key={idx} className="border rounded-lg p-2 text-sm bg-gray-50">
+              {(() => {
+                const entries = detailsModal.type === 'ot'
+                  ? detailsModal.record.financials?.otDetails
+                  : detailsModal.record.financials?.deductionDetails;
+                if (!entries?.length) return <p className="text-sm text-gray-500">No detail entries found.</p>;
+                return entries.map((entry, i) => (
+                  <div key={i} className="border rounded-lg p-2 text-sm bg-gray-50">
                     {detailsModal.type === 'ot' ? (
                       <p>{entry.type === 'manual' ? `Amount: PKR ${entry.amount}` : `Hours: ${entry.hours} x ${entry.rate}x`} · {entry.reason}</p>
                     ) : (
                       <p>Amount: PKR {entry.amount} · {entry.reason}</p>
                     )}
                   </div>
-                ))
-              ) : (
-                <p className="text-sm text-gray-500">No detail entries found.</p>
-              )}
+                ));
+              })()}
             </div>
           </div>
         </div>

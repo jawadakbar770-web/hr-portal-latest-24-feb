@@ -1,134 +1,227 @@
-import express from "express";
-import AttendanceLog from "../models/AttendanceLog.js";
-import Employee from "../models/Employee.js";
-import { adminAuth } from "../middleware/auth.js";
-import { parseDDMMYYYY, formatDate } from "../utils/dateUtils.js";
-import { isLate, calculateHours } from "../utils/timeCalculator.js";
+// routes/payroll.js
+
+import express from 'express';
+import AttendanceLog from '../models/AttendanceLog.js';
+import Employee      from '../models/Employee.js';
+import { adminAuth, employeeAuth } from '../middleware/auth.js';
+import { buildDateRange, formatDate } from '../utils/dateUtils.js';
+import { isLate, getCompanyMonthDates, getRecentPayPeriods } from '../utils/timeCalculator.js';
 
 const router = express.Router();
 
-// Helper: Get company month dates (18th to 17th)
-function getCompanyMonthDates(date = new Date()) {
-  const year = date.getFullYear();
-  const month = date.getMonth();
-  const day = date.getDate();
+// ─── shared helpers ───────────────────────────────────────────────────────────
 
-  let startDate, endDate;
+/**
+ * Accept dd/mm/yyyy OR YYYY-MM-DD for both params.
+ * Delegates to the shared buildDateRange so parsing logic lives in one place.
+ * Returns { start, end } or null.
+ */
+function parseDateRange(fromDate, toDate) {
+  const range = buildDateRange(fromDate, toDate);  // handles both formats + validation
+  if (!range) return null;
+  return { start: range.$gte, end: range.$lte };
+}
 
-  if (day >= 18) {
-    startDate = new Date(year, month, 18);
-    endDate = new Date(year, month + 1, 17);
+const n      = (v) => { const x = Number(v); return isFinite(x) ? x : 0; };
+const round2 = (v) => parseFloat(n(v).toFixed(2));
+
+/** Count Mon–Fri working days between two dates inclusive */
+function workingDaysBetween(start, end) {
+  let count = 0;
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const day = d.getDay();
+    if (day !== 0 && day !== 6) count++;
+  }
+  return count;
+}
+
+/**
+ * Build per-employee payroll totals from their AttendanceLog records.
+ * Monthly salary is pro-rated by (presentDays + leaveDays) / workingDays.
+ */
+function calcEmployeeTotals(emp, records, workingDays) {
+  const presentDays = records.filter(r => r.status === 'Present' || r.status === 'Late').length;
+  const leaveDays   = records.filter(r => r.status === 'Leave').length;
+  const absentDays  = records.filter(r => r.status === 'Absent').length;
+  const lateDays    = records.filter(r => r.status === 'Late').length;
+
+  const totalDeduction = records.reduce((s, r) => s + n(r.financials?.deduction), 0);
+  const totalOt        = records.reduce((s, r) => s + n(r.financials?.otAmount),   0);
+  const totalOtHours   = records.reduce((s, r) => s + n(r.financials?.otHours),    0);
+
+  let baseSalary;
+  if (emp.salaryType === 'monthly' && emp.monthlySalary) {
+    baseSalary = (emp.monthlySalary / (workingDays || 1)) * (presentDays + leaveDays);
   } else {
-    startDate = new Date(year, month - 1, 18);
-    endDate = new Date(year, month, 17);
+    baseSalary = records.reduce((s, r) => s + n(r.financials?.basePay), 0);
   }
 
-  return { startDate, endDate };
-}
+  const netPayable = Math.max(0, baseSalary - totalDeduction + totalOt);
 
-function parseDateRange(fromDate, toDate) {
-  const parseInputDate = (value) => {
-    if (!value) return null;
-
-    // Support both dd/mm/yyyy and native input date format (yyyy-mm-dd).
-    if (String(value).includes("/")) {
-      return parseDDMMYYYY(value);
-    }
-
-    const parsed = new Date(value);
-    if (Number.isNaN(parsed.getTime())) return null;
-    parsed.setHours(0, 0, 0, 0);
-    return parsed;
+  return {
+    empId:          emp._id,
+    empNumber:      emp.employeeNumber,
+    name:           `${emp.firstName} ${emp.lastName}`,
+    department:     emp.department,
+    salaryType:     emp.salaryType   || 'hourly',
+    hourlyRate:     emp.hourlyRate,
+    monthlySalary:  emp.monthlySalary || null,
+    presentDays, leaveDays, absentDays, lateDays,
+    workingDays,
+    baseSalary:     round2(baseSalary),
+    totalDeduction: round2(totalDeduction),
+    totalOt:        round2(totalOt),
+    totalOtHours:   round2(totalOtHours),
+    netPayable:     round2(netPayable),
+    recordCount:    records.length
   };
-
-  const start = parseInputDate(fromDate);
-  const end = parseInputDate(toDate);
-
-  if (!start || !end) return null;
-
-  start.setHours(0, 0, 0, 0);
-  end.setHours(23, 59, 59, 999);
-
-  return { start, end };
 }
 
-function normalizeNumber(value) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : 0;
+/**
+ * Build per-day breakdown rows.
+ * Shared by admin detail view and employee salary page — no duplication.
+ */
+function buildDailyBreakdown(records) {
+  return records.map(r => ({
+    date:             formatDate(r.date),
+    dateRaw:          r.date,
+    status:           r.status,
+    inTime:           r.inOut?.in          || '--',
+    outTime:          r.inOut?.out         || '--',
+    outNextDay:       r.inOut?.outNextDay  || false,
+    hoursWorked:      round2(n(r.financials?.hoursWorked)),   // correct field (not hoursPerDay)
+    basePay:          round2(n(r.financials?.basePay)),
+    deduction:        round2(n(r.financials?.deduction)),
+    otHours:          round2(n(r.financials?.otHours)),
+    otAmount:         round2(n(r.financials?.otAmount)),
+    finalDayEarning:  round2(n(r.financials?.finalDayEarning)),
+    deductionDetails: r.financials?.deductionDetails || [],
+    otDetails:        r.financials?.otDetails        || []
+  }));
 }
 
-// **SECTION 1: Attendance & Discipline Overview**
-router.post("/attendance-overview", adminAuth, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMPLOYEE ROUTES  (req #7)
+// Registered BEFORE /:empId param routes — prevents Express swallowing /my/*
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── GET /api/payroll/my/periods ─────────────────────────────────────────────
+
+router.get('/my/periods', employeeAuth, async (req, res) => {
   try {
-    const { fromDate, toDate, filterType } = req.body;
+    const periods = getRecentPayPeriods(6).map(p => ({
+      startDate:   formatDate(p.startDate),
+      endDate:     formatDate(p.endDate),
+      periodLabel: p.periodLabel
+    }));
+    return res.json({ success: true, periods });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
-    const range = parseDateRange(fromDate, toDate);
+// ─── GET /api/payroll/my/summary  (req #7) ───────────────────────────────────
+// Employee selects a date range and sees their own:
+// baseSalary | deductions | OT | netSalary  +  day-by-day breakdown
 
+router.get('/my/summary', employeeAuth, async (req, res) => {
+  try {
+    const range = parseDateRange(req.query.startDate, req.query.endDate);
     if (!range) {
       return res.status(400).json({
-        message: "Invalid date format. Use dd/mm/yyyy",
+        success: false,
+        message: 'startDate and endDate required (dd/mm/yyyy or YYYY-MM-DD)'
       });
     }
-
     const { start, end } = range;
 
-    start.setHours(0, 0, 0, 0);
-    end.setHours(23, 59, 59, 999);
+    const [emp, records] = await Promise.all([
+      Employee.findById(req.userId).lean(),
+      AttendanceLog.find({
+        empId: req.userId, date: { $gte: start, $lte: end }, isDeleted: false
+      }).sort({ date: 1 }).lean()
+    ]);
 
-    const employees = await Employee.find({
-      status: "Active",
-      isArchived: false,
-      isDeleted: false,
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    const workingDays    = workingDaysBetween(start, end);
+    const totals         = calcEmployeeTotals(emp, records, workingDays);
+    const dailyBreakdown = buildDailyBreakdown(records);
+
+    return res.json({
+      success: true,
+      summary: {
+        empName:          totals.name,
+        empNumber:        totals.empNumber,
+        department:       totals.department,
+        salaryType:       totals.salaryType,
+        periodStart:      formatDate(start),
+        periodEnd:        formatDate(end),
+        totalWorkingDays: workingDays,
+        presentDays:      totals.presentDays,
+        lateDays:         totals.lateDays,
+        absentDays:       totals.absentDays,
+        leaveDays:        totals.leaveDays,
+        baseSalary:       totals.baseSalary,
+        totalDeduction:   totals.totalDeduction,
+        totalOtHours:     totals.totalOtHours,
+        totalOtAmount:    totals.totalOt,
+        netSalary:        totals.netPayable
+      },
+      dailyBreakdown
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
-    const attendance = await AttendanceLog.find({
-      date: { $gte: start, $lte: end },
-      isDeleted: false,
-    });
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    const statusCount = {
-      "On-time": 0,
-      Late: 0,
-      Leave: 0,
-      Absent: 0,
-    };
+// ─── POST /api/payroll/attendance-overview ────────────────────────────────────
 
+router.post('/attendance-overview', adminAuth, async (req, res) => {
+  try {
+    const { fromDate, toDate, filterType } = req.body;
+    const range = parseDateRange(fromDate, toDate);
+    if (!range) return res.status(400).json({ success: false, message: 'Invalid date range' });
+    const { start, end } = range;
+
+    const [employees, allLogs] = await Promise.all([
+      Employee.find({ status: 'Active', isArchived: false, isDeleted: false }).lean(),
+      AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false }).lean()
+    ]);
+
+    const logMap = {};
+    for (const log of allLogs) {
+      logMap[`${log.empId}_${log.date.toISOString().slice(0, 10)}`] = log;
+    }
+
+    const statusCount  = { 'On-time': 0, Late: 0, Leave: 0, Absent: 0 };
     const detailedList = [];
 
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const currentDate = new Date(d);
-      currentDate.setHours(0, 0, 0, 0);
+      const iso  = d.toISOString().slice(0, 10);
+      const disp = formatDate(new Date(d));
 
       for (const emp of employees) {
-        const record = attendance.find(
-          (a) =>
-            a.empId.toString() === emp._id.toString() &&
-            new Date(a.date).getTime() === currentDate.getTime(),
-        );
-
-        let status = "Absent";
-        let delayMinutes = 0;
-        let note = "No record found";
+        const record = logMap[`${emp._id}_${iso}`];
+        let status = 'Absent', delayMinutes = 0, note = 'No record found';
 
         if (record) {
-          if (record.status === "Leave") {
-            status = "Leave";
-            note = "Approved leave";
-          } else if (record.status === "Absent") {
-            status = "Absent";
-            note = record.metadata?.notes || "No record found";
+          if (record.status === 'Leave') {
+            status = 'Leave'; note = 'Approved leave';
+          } else if (record.status === 'Absent') {
+            status = 'Absent'; note = record.metadata?.notes || 'Absent';
           } else if (record.inOut?.in) {
             if (isLate(record.inOut.in, record.shift.start)) {
-              status = "Late";
-              const [inH, inM] = record.inOut.in.split(":").map(Number);
-              const [shiftH, shiftM] = record.shift.start
-                .split(":")
-                .map(Number);
-              delayMinutes = inH * 60 + inM - (shiftH * 60 + shiftM);
-              note = `Late by ${delayMinutes} minutes`;
+              const [ih, im] = record.inOut.in.split(':').map(Number);
+              const [sh, sm] = record.shift.start.split(':').map(Number);
+              delayMinutes   = ih * 60 + im - (sh * 60 + sm);
+              status = 'Late'; note = `Late by ${delayMinutes} min`;
             } else {
-              status = "On-time";
-              note = "On time";
+              status = 'On-time'; note = 'On time';
             }
           }
         }
@@ -137,12 +230,9 @@ router.post("/attendance-overview", adminAuth, async (req, res) => {
 
         if (!filterType || status.toLowerCase() === filterType.toLowerCase()) {
           detailedList.push({
-            date: formatDate(currentDate), // Updated to use dd/mm/yyyy
-            empId: emp.employeeNumber,
+            date: disp, empId: emp.employeeNumber,
             name: `${emp.firstName} ${emp.lastName}`,
-            type: status,
-            reason: note,
-            delayMinutes,
+            type: status, reason: note, delayMinutes
           });
         }
       }
@@ -150,461 +240,315 @@ router.post("/attendance-overview", adminAuth, async (req, res) => {
 
     const total = Object.values(statusCount).reduce((a, b) => a + b, 0);
     const chartData = Object.entries(statusCount).map(([name, value]) => ({
-      name,
-      value,
-      percentage: ((value / total) * 100).toFixed(1),
+      name, value,
+      percentage: total > 0 ? ((value / total) * 100).toFixed(1) : '0.0'
     }));
 
-    res.json({
-      chartData,
-      detailedList,
-      summary: statusCount,
-    });
-  } catch (error) {
-    console.error("Error in attendance-overview:", error);
-    res.status(500).json({ message: error.message });
+    return res.json({ success: true, chartData, detailedList, summary: statusCount });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **SECTION 2: Performance Overview**
-router.post("/performance-overview", adminAuth, async (req, res) => {
+// ─── POST /api/payroll/performance-overview  (req #2) ─────────────────────────
+
+router.post('/performance-overview', adminAuth, async (req, res) => {
   try {
     const { fromDate, toDate } = req.body;
-
     const range = parseDateRange(fromDate, toDate);
-    if (!range) {
-      return res.status(400).json({
-        message: "Invalid date format. Use dd/mm/yyyy",
-      });
-    }
+    if (!range) return res.status(400).json({ success: false, message: 'Invalid date range' });
     const { start, end } = range;
 
-    const employees = await Employee.find({
-      status: "Active",
-      isArchived: false,
-      isDeleted: false,
-    });
+    const [employees, allLogs] = await Promise.all([
+      Employee.find({ status: 'Active', isArchived: false, isDeleted: false }).lean(),
+      AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false }).lean()
+    ]);
 
-    const performance = [];
+    const workingDays = workingDaysBetween(start, end);
+    const logsByEmp   = {};
+    for (const log of allLogs) {
+      const key = String(log.empId);
+      (logsByEmp[key] ??= []).push(log);
+    }
 
-    for (const emp of employees) {
-      const empAttendance = await AttendanceLog.find({
-        empId: emp._id,
-        date: { $gte: start, $lte: end },
-        isDeleted: false,
-      });
+    const performance = employees.map(emp => {
+      const records      = logsByEmp[String(emp._id)] || [];
+      const presentDays  = records.filter(r => r.status === 'Present' || r.status === 'Late').length;
+      const leaveDays    = records.filter(r => r.status === 'Leave').length;
+      const absentDays   = records.filter(r => r.status === 'Absent').length;
+      const lateDays     = records.filter(r => r.status === 'Late').length;
+      const totalOtHours = records.reduce((s, r) => s + n(r.financials?.otHours), 0);
 
-      const present = empAttendance.filter(
-        (a) => a.status === "Present" || a.status === "Late",
-      ).length;
-      const absent = empAttendance.filter((a) => a.status === "Absent").length;
-      const leave = empAttendance.filter((a) => a.status === "Leave").length;
+      const attendanceRate  = workingDays > 0
+        ? ((presentDays + leaveDays) / workingDays) * 100 : 0;
+      const punctualityRate = presentDays > 0
+        ? ((presentDays - lateDays) / presentDays) * 100 : 100;
+      const otScore = Math.min(100, (totalOtHours / Math.max(1, workingDays)) * 100);
 
-      const score =
-        empAttendance.length > 0
-          ? Math.round(((present + leave) / empAttendance.length) * 100)
-          : 0;
+      const score = Math.round(
+        attendanceRate * 0.5 + punctualityRate * 0.3 + otScore * 0.2
+      );
 
-      performance.push({
-        empId: emp.employeeNumber,
-        name: `${emp.firstName} ${emp.lastName}`,
+      return {
+        empId:            emp.employeeNumber,
+        empObjectId:      emp._id,
+        name:             `${emp.firstName} ${emp.lastName}`,
+        department:       emp.department,
         performanceScore: score,
-        present,
-        absent,
-        leave,
-        status:
-          score >= 90
-            ? "Excellent"
-            : score >= 75
-              ? "Good"
-              : "Needs Improvement",
-      });
-    }
+        attendanceRate:   round2(attendanceRate),
+        punctualityRate:  round2(punctualityRate),
+        presentDays, leaveDays, absentDays, lateDays,
+        totalOtHours:     round2(totalOtHours),
+        workingDays,
+        rating: score >= 90 ? 'Excellent'
+               : score >= 75 ? 'Good'
+               : score >= 60 ? 'Average'
+               : 'Poor'
+      };
+    });
 
-    res.json({ performance });
-  } catch (error) {
-    console.error("Error in performance-overview:", error);
-    res.status(500).json({ message: error.message });
+    const ratingCounts = { Excellent: 0, Good: 0, Average: 0, Poor: 0 };
+    performance.forEach(p => ratingCounts[p.rating]++);
+
+    const pieData = Object.entries(ratingCounts).map(([name, value]) => ({
+      name, value,
+      percentage: performance.length > 0
+        ? ((value / performance.length) * 100).toFixed(1) : '0.0'
+    }));
+
+    return res.json({ success: true, performance, pieData, workingDays });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **SECTION 3: Salary Summary**
-router.post("/salary-summary", adminAuth, async (req, res) => {
+// ─── POST /api/payroll/salary-summary  (req #1) ───────────────────────────────
+
+router.post('/salary-summary', adminAuth, async (req, res) => {
   try {
     const { fromDate, toDate } = req.body;
-
     const range = parseDateRange(fromDate, toDate);
-    if (!range) {
-      return res.status(400).json({
-        message: "Invalid date format. Use dd/mm/yyyy",
-      });
-    }
+    if (!range) return res.status(400).json({ success: false, message: 'Invalid date range' });
     const { start, end } = range;
 
-    start.setHours(0, 0, 0, 0);
-    end.setHours(23, 59, 59, 999);
+    const [employees, allLogs] = await Promise.all([
+      Employee.find({ status: 'Active', isArchived: false, isDeleted: false }).lean(),
+      AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false }).lean()
+    ]);
 
-    const attendance = await AttendanceLog.find({
-      date: { $gte: start, $lte: end },
-      isDeleted: false,
-    });
-
-    const employees = await Employee.find({
-      status: "Active",
-      isArchived: false,
-      isDeleted: false,
-    });
-
-    const summary = [];
-
-    for (const emp of employees) {
-      const empRecords = attendance.filter(
-        (a) => a.empId.toString() === emp._id.toString(),
-      );
-
-      const basicEarned = empRecords.reduce(
-        (sum, r) => sum + (r.financials?.basePay || 0),
-        0,
-      );
-      const otTotal = empRecords.reduce(
-        (sum, r) => sum + (r.financials?.otAmount || 0),
-        0,
-      );
-      const deductionTotal = empRecords.reduce(
-        (sum, r) => sum + (r.financials?.deduction || 0),
-        0,
-      );
-      const netPayable = empRecords.reduce(
-        (sum, r) => sum + (r.financials?.finalDayEarning || 0),
-        0,
-      );
-
-      summary.push({
-        empId: emp._id,
-        empNumber: emp.employeeNumber,
-        name: `${emp.firstName} ${emp.lastName}`,
-        basicEarned: parseFloat(basicEarned.toFixed(2)),
-        otTotal: parseFloat(otTotal.toFixed(2)),
-        deductionTotal: parseFloat(deductionTotal.toFixed(2)),
-        netPayable: parseFloat(netPayable.toFixed(2)),
-        recordCount: empRecords.length,
-      });
+    const workingDays = workingDaysBetween(start, end);
+    const logsByEmp   = {};
+    for (const log of allLogs) {
+      const key = String(log.empId);
+      (logsByEmp[key] ??= []).push(log);
     }
 
-    summary.sort((a, b) => a.name.localeCompare(b.name));
+    const summary = employees
+      .map(emp => calcEmployeeTotals(emp, logsByEmp[String(emp._id)] || [], workingDays))
+      .sort((a, b) => a.name.localeCompare(b.name));
 
     const totals = {
-      totalBasicEarned: parseFloat(
-        summary.reduce((s, e) => s + e.basicEarned, 0).toFixed(2),
-      ),
-      totalOT: parseFloat(
-        summary.reduce((s, e) => s + e.otTotal, 0).toFixed(2),
-      ),
-      totalDeductions: parseFloat(
-        summary.reduce((s, e) => s + e.deductionTotal, 0).toFixed(2),
-      ),
-      totalNetPayable: parseFloat(
-        summary.reduce((s, e) => s + e.netPayable, 0).toFixed(2),
-      ),
+      totalBaseSalary: round2(summary.reduce((s, e) => s + e.baseSalary,     0)),
+      totalOT:         round2(summary.reduce((s, e) => s + e.totalOt,        0)),
+      totalDeductions: round2(summary.reduce((s, e) => s + e.totalDeduction, 0)),
+      totalNetPayable: round2(summary.reduce((s, e) => s + e.netPayable,     0))
     };
 
-    res.json({ summary, totals });
-  } catch (error) {
-    console.error("Error in salary-summary:", error);
-    res.status(500).json({ message: error.message });
+    return res.json({ success: true, summary, totals, workingDays });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// Full payroll report with per-day details for each employee in the selected date range.
-router.post("/report", adminAuth, async (req, res) => {
+// ─── POST /api/payroll/report ─────────────────────────────────────────────────
+
+router.post('/report', adminAuth, async (req, res) => {
   try {
-    const { fromDate, toDate, search = "" } = req.body;
+    const { fromDate, toDate, search = '' } = req.body;
     const range = parseDateRange(fromDate, toDate);
-
-    if (!range) {
-      return res.status(400).json({ message: "Invalid date format. Use dd/mm/yyyy or yyyy-mm-dd" });
-    }
-
+    if (!range) return res.status(400).json({ success: false, message: 'Invalid date range' });
     const { start, end } = range;
 
-    const employees = await Employee.find({
-      status: "Active",
-      isArchived: false,
-      isDeleted: false,
-    }).sort({ firstName: 1, lastName: 1 });
+    const [employees, allLogs] = await Promise.all([
+      Employee.find({ status: 'Active', isArchived: false, isDeleted: false })
+        .sort({ firstName: 1, lastName: 1 }).lean(),
+      AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false })
+        .sort({ date: 1 }).lean()
+    ]);
 
-    const attendanceRecords = await AttendanceLog.find({
-      date: { $gte: start, $lte: end },
-      isDeleted: false,
-    }).sort({ date: 1 });
-
-    const searchTerm = String(search || "").trim().toLowerCase();
+    const workingDays = workingDaysBetween(start, end);
+    const term        = search.trim().toLowerCase();
+    const logsByEmp   = {};
+    for (const log of allLogs) {
+      const key = String(log.empId);
+      (logsByEmp[key] ??= []).push(log);
+    }
 
     const report = employees
-      .map((employee) => {
-        const fullName = `${employee.firstName} ${employee.lastName}`;
-
-        if (
-          searchTerm &&
-          !fullName.toLowerCase().includes(searchTerm) &&
-          !String(employee.employeeNumber || "").toLowerCase().includes(searchTerm)
-        ) {
-          return null;
-        }
-
-        const records = attendanceRecords.filter(
-          (item) => item.empId.toString() === employee._id.toString(),
-        );
-
-        // Daily rows preserve deduction/OT details for nested UI rendering.
-        const dailyAttendance = records.map((row) => {
-          const basePay = normalizeNumber(row.financials?.basePay);
-          const deduction = normalizeNumber(row.financials?.deduction);
-          const otAmount = normalizeNumber(row.financials?.otAmount);
-          const finalEarning = normalizeNumber(row.financials?.finalDayEarning);
-
-          return {
-            date: formatDate(row.date),
-            status: row.status,
-            inTime: row.inOut?.in || "--",
-            outTime: row.inOut?.out || "--",
-            hoursPerDay: normalizeNumber(row.financials?.hoursPerDay),
-            basePay,
-            deduction,
-            otAmount,
-            finalEarning,
-            deductionDetails: row.financials?.deductionDetails || [],
-            otDetails: row.financials?.otDetails || [],
-          };
-        });
-
-        // Aggregate totals from the daily rows to keep parent + nested table fully consistent.
-        const totals = dailyAttendance.reduce(
-          (acc, day) => {
-            acc.basePay += day.basePay;
-            acc.deduction += day.deduction;
-            acc.otAmount += day.otAmount;
-            acc.finalEarning += day.finalEarning;
-            return acc;
-          },
-          { basePay: 0, deduction: 0, otAmount: 0, finalEarning: 0 },
-        );
-
-        return {
-          empId: employee._id,
-          empNumber: employee.employeeNumber,
-          name: fullName,
-          totals: {
-            basePay: Number(totals.basePay.toFixed(2)),
-            deduction: Number(totals.deduction.toFixed(2)),
-            otAmount: Number(totals.otAmount.toFixed(2)),
-            finalEarning: Number(totals.finalEarning.toFixed(2)),
-          },
-          dailyAttendance,
-        };
+      .filter(emp => {
+        if (!term) return true;
+        const full = `${emp.firstName} ${emp.lastName}`.toLowerCase();
+        return full.includes(term) || emp.employeeNumber.toLowerCase().includes(term);
       })
-      .filter(Boolean);
-
-    const grandTotals = report.reduce(
-      (acc, employee) => {
-        acc.basePay += employee.totals.basePay;
-        acc.deduction += employee.totals.deduction;
-        acc.otAmount += employee.totals.otAmount;
-        acc.finalEarning += employee.totals.finalEarning;
-        return acc;
-      },
-      { basePay: 0, deduction: 0, otAmount: 0, finalEarning: 0 },
-    );
-
-    res.json({
-      report,
-      grandTotals: {
-        basePay: Number(grandTotals.basePay.toFixed(2)),
-        deduction: Number(grandTotals.deduction.toFixed(2)),
-        otAmount: Number(grandTotals.otAmount.toFixed(2)),
-        finalEarning: Number(grandTotals.finalEarning.toFixed(2)),
-      },
-    });
-  } catch (error) {
-    console.error("Error in payroll report:", error);
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// **Employee Detailed Breakdown**
-router.get("/employee-breakdown/:empId", adminAuth, async (req, res) => {
-  try {
-    const { fromDate, toDate } = req.query;
-
-    const range = parseDateRange(fromDate, toDate);
-    if (!range) {
-      return res.status(400).json({
-        message: "Invalid date format. Use dd/mm/yyyy",
+      .map(emp => {
+        const records = logsByEmp[String(emp._id)] || [];
+        return {
+          ...calcEmployeeTotals(emp, records, workingDays),
+          dailyAttendance: buildDailyBreakdown(records)  // shared helper, no duplication
+        };
       });
-    }
-    const { start, end } = range;
 
-    start.setHours(0, 0, 0, 0);
-    end.setHours(23, 59, 59, 999);
-
-    const emp = await Employee.findById(req.params.empId);
-    if (!emp) return res.status(404).json({ message: "Employee not found" });
-
-    const records = await AttendanceLog.find({
-      empId: req.params.empId,
-      date: { $gte: start, $lte: end },
-      isDeleted: false,
-    }).sort({ date: 1 });
-
-    const dailyBreakdown = records.map((r) => ({
-      date: formatDate(r.date), // Updated to use dd/mm/yyyy
-      inOut: r.inOut,
-      status: r.status,
-      hoursPerDay: r.financials.hoursPerDay,
-      basePay: r.financials.basePay,
-      otAmount: r.financials.otAmount,
-      deduction: r.financials.deduction,
-      dailyEarning: r.financials.finalDayEarning,
-    }));
-
-    const totals = {
-      basicEarned: parseFloat(
-        dailyBreakdown.reduce((s, d) => s + d.basePay, 0).toFixed(2),
-      ),
-      otTotal: parseFloat(
-        dailyBreakdown.reduce((s, d) => s + d.otAmount, 0).toFixed(2),
-      ),
-      deductionTotal: parseFloat(
-        dailyBreakdown.reduce((s, d) => s + d.deduction, 0).toFixed(2),
-      ),
-      netPayable: parseFloat(
-        dailyBreakdown.reduce((s, d) => s + d.dailyEarning, 0).toFixed(2),
-      ),
+    const grandTotals = {
+      totalBaseSalary: round2(report.reduce((s, e) => s + e.baseSalary,     0)),
+      totalOT:         round2(report.reduce((s, e) => s + e.totalOt,        0)),
+      totalDeductions: round2(report.reduce((s, e) => s + e.totalDeduction, 0)),
+      totalNetPayable: round2(report.reduce((s, e) => s + e.netPayable,     0))
     };
 
-    res.json({
-      employee: {
-        id: emp._id,
-        name: `${emp.firstName} ${emp.lastName}`,
-        employeeNumber: emp.employeeNumber,
-        hourlyRate: emp.hourlyRate,
-        shift: emp.shift,
-      },
-      dailyBreakdown,
-      totals,
-    });
-  } catch (error) {
-    console.error("Error in employee-breakdown:", error);
-    res.status(500).json({ message: error.message });
+    return res.json({ success: true, report, grandTotals, workingDays });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **Live Monthly Payroll Block**
-router.get("/live-payroll", adminAuth, async (req, res) => {
+// ─── GET /api/payroll/employee-breakdown/:empId ───────────────────────────────
+
+router.get('/employee-breakdown/:empId', adminAuth, async (req, res) => {
   try {
-    const { startDate, endDate } = getCompanyMonthDates();
-
-    const attendance = await AttendanceLog.find({
-      date: { $gte: startDate, $lte: new Date() },
-      isDeleted: false,
-    });
-
-    const totalPayroll = attendance.reduce(
-      (sum, r) => sum + (r.financials?.finalDayEarning || 0),
-      0,
-    );
-
-    res.json({
-      totalPayroll: parseFloat(totalPayroll.toFixed(2)),
-      periodStart: formatDate(startDate), // Updated to use dd/mm/yyyy
-      periodEnd: formatDate(endDate),     // Updated to use dd/mm/yyyy
-      asOf: formatDate(new Date()),       // Updated to use dd/mm/yyyy
-    });
-  } catch (error) {
-    console.error("Error in live-payroll:", error);
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// **Export Payroll (CSV)**
-router.post("/export", adminAuth, async (req, res) => {
-  try {
-    const { fromDate, toDate, format } = req.body;
-    const range = parseDateRange(fromDate, toDate);
-    if (!range) {
-      return res.status(400).json({
-        message: "Invalid date format. Use dd/mm/yyyy",
-      });
-    }
+    const range = parseDateRange(req.query.fromDate, req.query.toDate);
+    if (!range) return res.status(400).json({ success: false, message: 'Invalid date range' });
     const { start, end } = range;
 
-    start.setHours(0, 0, 0, 0);
-    end.setHours(23, 59, 59, 999);
+    const [emp, records] = await Promise.all([
+      Employee.findOne({ _id: req.params.empId, isDeleted: false }).lean(),
+      AttendanceLog.find({
+        empId: req.params.empId, date: { $gte: start, $lte: end }, isDeleted: false
+      }).sort({ date: 1 }).lean()
+    ]);
 
-    const attendance = await AttendanceLog.find({
-      date: { $gte: start, $lte: end },
-      isDeleted: false,
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    const workingDays    = workingDaysBetween(start, end);
+    const empTotals      = calcEmployeeTotals(emp, records, workingDays);
+    const dailyBreakdown = buildDailyBreakdown(records);
+
+    return res.json({
+      success: true,
+      employee: {
+        id:             emp._id,
+        name:           `${emp.firstName} ${emp.lastName}`,
+        employeeNumber: emp.employeeNumber,
+        department:     emp.department,
+        salaryType:     emp.salaryType   || 'hourly',
+        hourlyRate:     emp.hourlyRate,
+        monthlySalary:  emp.monthlySalary || null,
+        shift:          emp.shift
+      },
+      dailyBreakdown,
+      totals: {
+        baseSalary:     empTotals.baseSalary,
+        totalDeduction: empTotals.totalDeduction,
+        totalOt:        empTotals.totalOt,
+        totalOtHours:   empTotals.totalOtHours,
+        netPayable:     empTotals.netPayable,
+        presentDays:    empTotals.presentDays,
+        leaveDays:      empTotals.leaveDays,
+        absentDays:     empTotals.absentDays,
+        lateDays:       empTotals.lateDays,    // was missing from original totals object
+        workingDays
+      }
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
-    const employees = await Employee.find({
-      status: "Active",
-      isArchived: false,
-      isDeleted: false,
+// ─── GET /api/payroll/live-payroll ────────────────────────────────────────────
+
+router.get('/live-payroll', adminAuth, async (req, res) => {
+  try {
+    const { startDate, endDate } = getCompanyMonthDates();
+    const now = new Date();
+
+    const logs = await AttendanceLog.find({
+      date: { $gte: startDate, $lte: now }, isDeleted: false
+    }).lean();
+
+    const totalPayroll = round2(
+      logs.reduce((s, r) => s + n(r.financials?.finalDayEarning), 0)
+    );
+
+    return res.json({
+      success:     true,
+      totalPayroll,
+      periodStart: formatDate(startDate),
+      periodEnd:   formatDate(endDate),
+      asOf:        formatDate(now)
     });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
-    const summary = [];
+// ─── POST /api/payroll/export ─────────────────────────────────────────────────
 
-    for (const emp of employees) {
-      const empRecords = attendance.filter(
-        (a) => a.empId.toString() === emp._id.toString(),
-      );
+router.post('/export', adminAuth, async (req, res) => {
+  try {
+    const { fromDate, toDate, format = 'json' } = req.body;
+    const range = parseDateRange(fromDate, toDate);
+    if (!range) return res.status(400).json({ success: false, message: 'Invalid date range' });
+    const { start, end } = range;
 
-      const basicEarned = empRecords.reduce(
-        (sum, r) => sum + (r.financials?.basePay || 0),
-        0,
-      );
-      const otTotal = empRecords.reduce(
-        (sum, r) => sum + (r.financials?.otAmount || 0),
-        0,
-      );
-      const deductionTotal = empRecords.reduce(
-        (sum, r) => sum + (r.financials?.deduction || 0),
-        0,
-      );
-      const netPayable = empRecords.reduce(
-        (sum, r) => sum + (r.financials?.finalDayEarning || 0),
-        0,
-      );
+    const [employees, allLogs] = await Promise.all([
+      Employee.find({ status: 'Active', isArchived: false, isDeleted: false }).lean(),
+      AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false }).lean()
+    ]);
 
-      summary.push({
-        empNumber: emp.employeeNumber,
-        name: `${emp.firstName} ${emp.lastName}`,
-        basicEarned: parseFloat(basicEarned.toFixed(2)),
-        otTotal: parseFloat(otTotal.toFixed(2)),
-        deductionTotal: parseFloat(deductionTotal.toFixed(2)),
-        netPayable: parseFloat(netPayable.toFixed(2)),
-      });
+    const workingDays = workingDaysBetween(start, end);
+    const logsByEmp   = {};
+    for (const log of allLogs) {
+      const key = String(log.empId);
+      (logsByEmp[key] ??= []).push(log);
     }
 
-    if (format === "csv") {
-      let csv =
-        "Employee Number,Name,Basic Earned,OT Total,Deductions,Net Payable\n";
-      summary.forEach((emp) => {
-        csv += `${emp.empNumber},"${emp.name}",${emp.basicEarned},${emp.otTotal},${emp.deductionTotal},${emp.netPayable}\n`;
-      });
+    const rows = employees
+      .map(emp => calcEmployeeTotals(emp, logsByEmp[String(emp._id)] || [], workingDays))
+      .sort((a, b) => a.name.localeCompare(b.name));
 
-      res.setHeader("Content-Type", "text/csv");
-      res.setHeader(
-        "Content-Disposition",
-        'attachment; filename="payroll.csv"',
+    if (format === 'csv') {
+      // All columns present — lateDays and OT Hours were missing from original
+      const headers = [
+        'Employee Number', 'Name', 'Department', 'Salary Type',
+        'Working Days', 'Present Days', 'Leave Days', 'Absent Days', 'Late Days',
+        'Base Salary', 'OT Hours', 'OT Amount', 'Deductions', 'Net Payable'
+      ];
+      const lines = rows.map(e =>
+        [
+          e.empNumber,
+          `"${e.name}"`,     // quoted — handles commas in names
+          e.department,
+          e.salaryType,
+          e.workingDays,
+          e.presentDays,
+          e.leaveDays,
+          e.absentDays,
+          e.lateDays,        // was missing
+          e.baseSalary,
+          e.totalOtHours,    // was missing
+          e.totalOt,
+          e.totalDeduction,
+          e.netPayable
+        ].join(',')
       );
-      res.send(csv);
-    } else {
-      res.json({ summary });
+
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="payroll_${fromDate}_${toDate}.csv"`);
+      return res.send([headers.join(','), ...lines].join('\n'));
     }
-  } catch (error) {
-    console.error("Error in export:", error);
-    res.status(500).json({ message: error.message });
+
+    return res.json({ success: true, summary: rows, workingDays });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 

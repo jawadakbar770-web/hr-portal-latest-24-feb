@@ -1,396 +1,501 @@
+// routes/requests.js
+
 import express from 'express';
-import jwt from 'jsonwebtoken';
-import LeaveRequest from '../models/LeaveRequest.js';
+import LeaveRequest      from '../models/LeaveRequest.js';
 import CorrectionRequest from '../models/CorrectionRequest.js';
-import AttendanceLog from '../models/AttendanceLog.js';
-import Employee from '../models/Employee.js';
-import { calculateHours } from '../utils/timeCalculator.js';
+import AttendanceLog     from '../models/AttendanceLog.js';
+import Employee          from '../models/Employee.js';
+import { auth, adminAuth, employeeAuth } from '../middleware/auth.js';
 import { parseDDMMYYYY, formatDate } from '../utils/dateUtils.js';
 
 const router = express.Router();
 
-// Middleware
-const auth = async (req, res, next) => {
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return res.status(401).json({ message: 'Unauthorized' });
+// ─── helpers ──────────────────────────────────────────────────────────────────
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await Employee.findById(decoded.id);
-    req.user = user;
-    req.role = decoded.role || (user.department === 'Manager' ? 'admin' : 'employee');
-    req.userId = decoded.id;
-    next();
-  } catch (error) {
-    res.status(401).json({ message: 'Unauthorized' });
-  }
+/** Minutes from "HH:mm" string */
+const toMin = (t) => {
+  if (!t) return 0;
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
 };
 
-function getLeaveBalance(joiningDate) {
-  const now = new Date();
-  const joinDate = new Date(joiningDate);
-  const daysElapsed = Math.floor((now - joinDate) / (1000 * 60 * 60 * 24));
-  const canApply = daysElapsed >= 90;
-  const daysUntilEligible = Math.max(0, 90 - daysElapsed);
-  
-  return { canApply, daysUntilEligible, holidayLeaves: 13, sickLeaves: 7 };
-}
+/** Hours worked between two HH:mm strings (handles overnight) */
+const calcHours = (inT, outT) => {
+  if (!inT || !outT) return 0;
+  let diff = toMin(outT) - toMin(inT);
+  if (diff < 0) diff += 1440;
+  return Math.max(0, diff / 60);
+};
 
-// **Submit leave request**
-router.post('/leave/submit', auth, async (req, res) => {
+/** Scheduled shift hours (handles night-shift) */
+const shiftHours = (shift) => calcHours(shift.start, shift.end) || 8;
+
+/**
+ * Determine correctionType from which corrected times are present.
+ * Falls back to 'Both' when both are provided.
+ */
+const resolveCorrectionType = (correctedIn, correctedOut) => {
+  if (correctedIn  && correctedOut) return 'Both';
+  if (correctedIn  && !correctedOut) return 'In';
+  if (!correctedIn && correctedOut)  return 'Out';
+  return 'Both';
+};
+
+// ─── POST /api/requests/leave/submit  (employee) ─────────────────────────────
+
+router.post('/leave/submit', employeeAuth, async (req, res) => {
   try {
     const { fromDate, toDate, leaveType, reason } = req.body;
-    
-    const parsedFrom = parseDDMMYYYY(fromDate);
-    const parsedTo = parseDDMMYYYY(toDate);
 
-    if (!parsedFrom || !parsedTo) {
-      return res.status(400).json({ message: 'Invalid date format. Use dd/mm/yyyy' });
-    }
-
-    const { canApply, daysUntilEligible } = getLeaveBalance(req.user.joiningDate);
-    if (!canApply) {
+    if (!fromDate || !toDate || !leaveType || !reason) {
       return res.status(400).json({
-        message: `You can apply for leave after ${daysUntilEligible} days`,
-        daysUntilEligible
+        success: false,
+        message: 'fromDate, toDate, leaveType, and reason are required'
       });
     }
-    
-    const existingRequest = await LeaveRequest.findOne({
-      empId: req.user._id,
-      status: 'Pending',
+
+    // Accept dd/mm/yyyy or ISO
+    let parsedFrom = parseDDMMYYYY(fromDate) || new Date(fromDate);
+    let parsedTo   = parseDDMMYYYY(toDate)   || new Date(toDate);
+
+    if (!parsedFrom || isNaN(parsedFrom) || !parsedTo || isNaN(parsedTo)) {
+      return res.status(400).json({ success: false, message: 'Invalid date format. Use dd/mm/yyyy or YYYY-MM-DD' });
+    }
+
+    if (parsedTo < parsedFrom) {
+      return res.status(400).json({ success: false, message: 'toDate must be on or after fromDate' });
+    }
+
+    // ── 90-day eligibility check ──────────────────────────────────────────────
+    const daysElapsed = Math.floor((Date.now() - new Date(req.user.joiningDate)) / 86_400_000);
+    if (daysElapsed < 90) {
+      return res.status(400).json({
+        success: false,
+        message: `Leave not eligible yet. ${90 - daysElapsed} day(s) remaining.`,
+        daysUntilEligible: 90 - daysElapsed
+      });
+    }
+
+    // ── overlap check — no two Pending/Approved leaves on the same dates ─────
+    const overlap = await LeaveRequest.findOne({
+      empId:    req.user._id,
+      status:   { $in: ['Pending', 'Approved'] },
       fromDate: { $lte: parsedTo },
-      toDate: { $gte: parsedFrom },
+      toDate:   { $gte: parsedFrom },
       isDeleted: false
     });
-    
-    if (existingRequest) {
+
+    if (overlap) {
       return res.status(400).json({
-        message: 'You already have a pending leave request for this date range.'
+        success: false,
+        message: 'You already have a leave request (Pending or Approved) overlapping these dates.'
       });
     }
-    
+
     const leaveRequest = new LeaveRequest({
-      empId: req.user._id,
+      empId:     req.user._id,
       empNumber: req.user.employeeNumber,
-      empName: `${req.user.firstName} ${req.user.lastName}`,
+      empName:   `${req.user.firstName} ${req.user.lastName}`,
       leaveType,
-      fromDate: parsedFrom,
-      toDate: parsedTo,
+      fromDate:  parsedFrom,
+      toDate:    parsedTo,
       reason,
-      status: 'Pending'
+      status:    'Pending'
     });
-    
+
     await leaveRequest.save();
-    
-    res.json({
-      message: 'Leave request submitted successfully',
-      requestId: leaveRequest._id
+
+    return res.status(201).json({
+      success:   true,
+      message:   'Leave request submitted',
+      requestId: leaveRequest._id,
+      request:   { ...leaveRequest.toObject(), fromDateFormatted: formatDate(parsedFrom), toDateFormatted: formatDate(parsedTo) }
     });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **Submit correction request**
-router.post('/correction/submit', auth, async (req, res) => {
+// ─── POST /api/requests/correction/submit  (employee) ────────────────────────
+
+router.post('/correction/submit', employeeAuth, async (req, res) => {
   try {
-    const { date, fromTime, toTime, reason } = req.body;
-    
-    const parsedDate = parseDDMMYYYY(date);
-    if (!parsedDate) {
-      return res.status(400).json({ message: 'Invalid date format. Use dd/mm/yyyy' });
+    const { date, correctedInTime, correctedOutTime, reason } = req.body;
+
+    if (!date || !reason) {
+      return res.status(400).json({ success: false, message: 'date and reason are required' });
     }
 
-    const existingRequest = await CorrectionRequest.findOne({
-      empId: req.user._id,
-      date: parsedDate,
-      status: 'Pending',
+    if (!correctedInTime && !correctedOutTime) {
+      return res.status(400).json({
+        success: false,
+        message: 'Provide at least one of correctedInTime or correctedOutTime'
+      });
+    }
+
+    let parsedDate = parseDDMMYYYY(date) || new Date(date);
+    if (!parsedDate || isNaN(parsedDate)) {
+      return res.status(400).json({ success: false, message: 'Invalid date format' });
+    }
+    parsedDate.setHours(0, 0, 0, 0);
+
+    // ── duplicate pending correction for same date ────────────────────────────
+    const existing = await CorrectionRequest.findOne({
+      empId:     req.user._id,
+      date:      parsedDate,
+      status:    'Pending',
       isDeleted: false
     });
-    
-    if (existingRequest) {
+
+    if (existing) {
       return res.status(400).json({
+        success: false,
         message: 'You already have a pending correction request for this date.'
       });
     }
-    
+
+    // Fetch original times from attendance log (may be null if no record yet)
     const attendance = await AttendanceLog.findOne({
       empId: req.user._id,
-      date: parsedDate
-    });
-    
+      date:  parsedDate
+    }).lean();
+
+    const correctionType = resolveCorrectionType(correctedInTime, correctedOutTime);
+
     const correctionRequest = new CorrectionRequest({
-      empId: req.user._id,
-      empNumber: req.user.employeeNumber,
-      empName: `${req.user.firstName} ${req.user.lastName}`,
-      date: parsedDate,
-      correctionType: 'Both',
-      originalInTime: attendance?.inOut?.in,
-      correctedInTime: fromTime,
-      originalOutTime: attendance?.inOut?.out,
-      correctedOutTime: toTime,
+      empId:           req.user._id,
+      empNumber:       req.user.employeeNumber,
+      empName:         `${req.user.firstName} ${req.user.lastName}`,
+      date:            parsedDate,
+      correctionType,
+      originalInTime:  attendance?.inOut?.in  || null,
+      correctedInTime: correctedInTime  || null,
+      originalOutTime: attendance?.inOut?.out || null,
+      correctedOutTime: correctedOutTime || null,
       reason,
       status: 'Pending'
     });
-    
+
     await correctionRequest.save();
-    
-    res.json({
-      message: 'Correction request submitted successfully',
-      requestId: correctionRequest._id
+
+    return res.status(201).json({
+      success:   true,
+      message:   'Correction request submitted',
+      requestId: correctionRequest._id,
+      request:   { ...correctionRequest.toObject(), dateFormatted: formatDate(parsedDate) }
     });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **Get employee requests**
-router.get('/my-requests', auth, async (req, res) => {
+// ─── GET /api/requests/my-requests  (employee) ───────────────────────────────
+
+router.get('/my-requests', employeeAuth, async (req, res) => {
   try {
-    const { fromDate, toDate, status, type } = req.query;
-    
-    let query = {
-      empId: req.user._id,
-      isDeleted: false
-    };
-    
+    const { status, type, fromDate, toDate } = req.query;
+
+    const baseQuery = { empId: req.user._id, isDeleted: false };
+
+    // Optional date filter applies to createdAt
     if (fromDate && toDate) {
-      const start = parseDDMMYYYY(fromDate);
-      const end = parseDDMMYYYY(toDate);
+      const start = parseDDMMYYYY(fromDate) || new Date(fromDate);
+      const end   = parseDDMMYYYY(toDate)   || new Date(toDate);
       if (start && end) {
-        query.createdAt = {
-          $gte: start,
-          $lte: end
-        };
+        end.setHours(23, 59, 59, 999);
+        baseQuery.createdAt = { $gte: start, $lte: end };
       }
     }
-    
-    let leaveRequests = [];
-    let correctionRequests = [];
-    
-    if (!type || type === 'leave') {
-      let leaveQuery = { ...query };
-      if (status) leaveQuery.status = status;
-      leaveRequests = await LeaveRequest.find(leaveQuery);
-    }
-    
-    if (!type || type === 'correction') {
-      let correctionQuery = { ...query };
-      if (status) correctionQuery.status = status;
-      correctionRequests = await CorrectionRequest.find(correctionQuery);
-    }
-    
-    res.json({
-      leaveRequests,
-      correctionRequests,
+
+    const leaveQuery      = { ...baseQuery, ...(status ? { status } : {}) };
+    const correctionQuery = { ...baseQuery, ...(status ? { status } : {}) };
+
+    const [leaveRequests, correctionRequests] = await Promise.all([
+      (!type || type === 'leave')      ? LeaveRequest.find(leaveQuery).sort({ createdAt: -1 }).lean()      : Promise.resolve([]),
+      (!type || type === 'correction') ? CorrectionRequest.find(correctionQuery).sort({ createdAt: -1 }).lean() : Promise.resolve([])
+    ]);
+
+    return res.json({
+      success: true,
+      leaveRequests:      leaveRequests.map(r => ({ ...r, fromDateFormatted: formatDate(r.fromDate), toDateFormatted: formatDate(r.toDate) })),
+      correctionRequests: correctionRequests.map(r => ({ ...r, dateFormatted: formatDate(r.date) })),
       total: leaveRequests.length + correctionRequests.length
     });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **Admin: Get all pending requests**
-router.get('/admin/pending', auth, async (req, res) => {
+// ─── GET /api/requests/admin/pending  (admin) ────────────────────────────────
+
+router.get('/admin/pending', adminAuth, async (req, res) => {
   try {
-    if (req.role !== 'admin') {
-      return res.status(403).json({ message: 'Unauthorized' });
-    }
-    
-    const defaultDate = new Date();
-    defaultDate.setDate(defaultDate.getDate() - 45);
+    // Default window: last 45 days (configurable via query param)
+    const days    = Math.min(Number(req.query.days) || 45, 180);
+    const cutoff  = new Date(Date.now() - days * 86_400_000);
 
-    const leaveRequests = await LeaveRequest.find({
-      status: 'Pending',
-      isDeleted: false,
-      createdAt: { $gte: defaultDate }
-    }).populate('empId', 'firstName lastName employeeNumber');
+    const [leaveRequests, correctionRequests] = await Promise.all([
+      LeaveRequest.find({ status: 'Pending', isDeleted: false, createdAt: { $gte: cutoff } })
+        .populate('empId', 'firstName lastName employeeNumber department')
+        .sort({ createdAt: -1 })
+        .lean(),
+      CorrectionRequest.find({ status: 'Pending', isDeleted: false, createdAt: { $gte: cutoff } })
+        .populate('empId', 'firstName lastName employeeNumber department')
+        .sort({ createdAt: -1 })
+        .lean()
+    ]);
 
-    const correctionRequests = await CorrectionRequest.find({
-      status: 'Pending',
-      isDeleted: false,
-      createdAt: { $gte: defaultDate }
-    }).populate('empId', 'firstName lastName employeeNumber');
-
-    res.json({
-      leaveRequests,
-      correctionRequests
+    return res.json({
+      success: true,
+      leaveRequests:      leaveRequests.map(r => ({ ...r, fromDateFormatted: formatDate(r.fromDate), toDateFormatted: formatDate(r.toDate) })),
+      correctionRequests: correctionRequests.map(r => ({ ...r, dateFormatted: formatDate(r.date) })),
+      counts: {
+        leave:      leaveRequests.length,
+        correction: correctionRequests.length,
+        total:      leaveRequests.length + correctionRequests.length
+      }
     });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **Admin: Approve leave request**
-router.patch('/leave/:requestId/approve', auth, async (req, res) => {
+// ─── PATCH /api/requests/leave/:requestId/approve  (admin) ───────────────────
+
+router.patch('/leave/:requestId/approve', adminAuth, async (req, res) => {
   try {
-    if (req.role !== 'admin') {
-      return res.status(403).json({ message: 'Unauthorized' });
+    const leaveRequest = await LeaveRequest.findOne({
+      _id: req.params.requestId, isDeleted: false
+    });
+    if (!leaveRequest) {
+      return res.status(404).json({ success: false, message: 'Leave request not found' });
     }
-    
-    const leaveRequest = await LeaveRequest.findById(req.params.requestId);
-    if (!leaveRequest) return res.status(404).json({ message: 'Request not found' });
-    
-    leaveRequest.status = 'Approved';
+    if (leaveRequest.status !== 'Pending') {
+      return res.status(400).json({ success: false, message: `Request already ${leaveRequest.status.toLowerCase()}` });
+    }
+
+    leaveRequest.status     = 'Approved';
     leaveRequest.approvedBy = req.userId;
     leaveRequest.approvedAt = new Date();
     await leaveRequest.save();
-    
-    // Update attendance records for each day
-    const currentDate = new Date(leaveRequest.fromDate);
-    while (currentDate <= leaveRequest.toDate) {
-      const dateObj = new Date(currentDate);
-      dateObj.setHours(0, 0, 0, 0);
 
-      const employee = await Employee.findById(leaveRequest.empId);
-      const hoursPerDay = calculateHours(employee.shift.start, employee.shift.end);
-      const basePay = hoursPerDay * employee.hourlyRate;
+    // ── load employee ONCE outside loop (fix N+1) ─────────────────────────────
+    const employee = await Employee.findById(leaveRequest.empId).lean();
+    if (!employee) {
+      return res.status(404).json({ success: false, message: 'Employee not found' });
+    }
 
-      await AttendanceLog.findOneAndUpdate(
-        { empId: leaveRequest.empId, date: dateObj },
-        {
-          $set: {
-            status: 'Leave',
-            empNumber: employee.employeeNumber,
-            empName: `${employee.firstName} ${employee.lastName}`,
-            department: employee.department,
-            shift: employee.shift,
-            hourlyRate: employee.hourlyRate,
-            financials: {
-              hoursPerDay,
-              basePay,
-              deduction: 0,
-              deductionDetails: [],
-              otMultiplier: 1,
-              otHours: 0,
-              otAmount: 0,
-              otDetails: [],
-              finalDayEarning: basePay
+    const schedHours = shiftHours(employee.shift);
+    const basePay    = schedHours * employee.hourlyRate;
+
+    // ── upsert one AttendanceLog per leave day ────────────────────────────────
+    const ops = [];
+    for (let d = new Date(leaveRequest.fromDate); d <= new Date(leaveRequest.toDate); d.setDate(d.getDate() + 1)) {
+      const day = new Date(d);
+      day.setHours(0, 0, 0, 0);
+
+      ops.push(
+        AttendanceLog.findOneAndUpdate(
+          { empId: leaveRequest.empId, date: day },
+          {
+            $setOnInsert: {
+              empId:      leaveRequest.empId,
+              date:       day,
+              empNumber:  employee.employeeNumber,
+              empName:    `${employee.firstName} ${employee.lastName}`,
+              department: employee.department
             },
-            metadata: {
-              source: 'leave_approval',
-              lastUpdatedBy: req.userId
+            $set: {
+              status:     'Leave',
+              inOut:      { in: null, out: null, outNextDay: false },
+              shift:      employee.shift,
+              hourlyRate: employee.hourlyRate,
+              financials: {
+                hoursWorked:      schedHours,   // correct field name (not hoursPerDay)
+                scheduledHours:   schedHours,
+                basePay,
+                deduction:        0,
+                deductionDetails: [],
+                otMultiplier:     1,
+                otHours:          0,
+                otAmount:         0,
+                otDetails:        [],
+                finalDayEarning:  basePay
+              },
+              manualOverride: false,
+              'metadata.source':         'leave_approval',
+              'metadata.lastUpdatedBy':  req.userId,
+              'metadata.lastModifiedAt': new Date()
             }
-          }
-        },
-        { upsert: true, new: true }
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        ).catch(() => null)
       );
-
-      currentDate.setDate(currentDate.getDate() + 1);
     }
-    
-    res.json({ message: 'Leave request approved', leaveRequest });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+    await Promise.all(ops);
+
+    return res.json({
+      success: true,
+      message: 'Leave request approved and attendance updated',
+      leaveRequest: { ...leaveRequest.toObject(), fromDateFormatted: formatDate(leaveRequest.fromDate), toDateFormatted: formatDate(leaveRequest.toDate) }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **Admin: Reject leave request**
-router.patch('/leave/:requestId/reject', auth, async (req, res) => {
+// ─── PATCH /api/requests/leave/:requestId/reject  (admin) ────────────────────
+
+router.patch('/leave/:requestId/reject', adminAuth, async (req, res) => {
   try {
-    if (req.role !== 'admin') {
-      return res.status(403).json({ message: 'Unauthorized' });
-    }
-    
     const { reason } = req.body;
-    const leaveRequest = await LeaveRequest.findById(req.params.requestId);
-    if (!leaveRequest) return res.status(404).json({ message: 'Request not found' });
-    
-    leaveRequest.status = 'Rejected';
-    leaveRequest.rejectionReason = reason;
+
+    const leaveRequest = await LeaveRequest.findOne({
+      _id: req.params.requestId, isDeleted: false
+    });
+    if (!leaveRequest) {
+      return res.status(404).json({ success: false, message: 'Leave request not found' });
+    }
+    if (leaveRequest.status !== 'Pending') {
+      return res.status(400).json({ success: false, message: `Request already ${leaveRequest.status.toLowerCase()}` });
+    }
+
+    leaveRequest.status          = 'Rejected';
+    leaveRequest.approvedBy      = req.userId;
+    leaveRequest.approvedAt      = new Date();
+    leaveRequest.rejectionReason = reason || 'Rejected by admin';
     await leaveRequest.save();
-    
-    res.json({ message: 'Leave request rejected', leaveRequest });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+
+    return res.json({ success: true, message: 'Leave request rejected', leaveRequest });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **Admin: Approve correction request**
-router.patch('/correction/:requestId/approve', auth, async (req, res) => {
+// ─── PATCH /api/requests/correction/:requestId/approve  (admin) ──────────────
+
+router.patch('/correction/:requestId/approve', adminAuth, async (req, res) => {
   try {
-    if (req.role !== 'admin') {
-      return res.status(403).json({ message: 'Unauthorized' });
+    const correctionRequest = await CorrectionRequest.findOne({
+      _id: req.params.requestId, isDeleted: false
+    });
+    if (!correctionRequest) {
+      return res.status(404).json({ success: false, message: 'Correction request not found' });
     }
-    
-    const correctionRequest = await CorrectionRequest.findById(req.params.requestId);
-    if (!correctionRequest) return res.status(404).json({ message: 'Request not found' });
-    
-    correctionRequest.status = 'Approved';
+    if (correctionRequest.status !== 'Pending') {
+      return res.status(400).json({ success: false, message: `Request already ${correctionRequest.status.toLowerCase()}` });
+    }
+
+    correctionRequest.status     = 'Approved';
     correctionRequest.approvedBy = req.userId;
     correctionRequest.approvedAt = new Date();
     await correctionRequest.save();
 
-    // Get employee for calculations
-    const employee = await Employee.findById(correctionRequest.empId);
-    if (!employee) return res.status(404).json({ message: 'Employee not found' });
+    // ── apply correction to attendance record ─────────────────────────────────
+    const employee = await Employee.findById(correctionRequest.empId).lean();
+    if (!employee) {
+      return res.status(404).json({ success: false, message: 'Employee not found' });
+    }
 
-    // Calculate new financials
-    const hoursPerDay = calculateHours(correctionRequest.correctedInTime, correctionRequest.correctedOutTime);
-    const basePay = hoursPerDay * employee.hourlyRate;
-    const finalDayEarning = basePay;
-
-    // UPSERT attendance
     const dateObj = new Date(correctionRequest.date);
     dateObj.setHours(0, 0, 0, 0);
 
-    const attendance = await AttendanceLog.findOneAndUpdate(
-      { empId: correctionRequest.empId, date: dateObj },
-      {
-        $set: {
-          inOut: {
-            in: correctionRequest.correctedInTime,
-            out: correctionRequest.correctedOutTime
-          },
-          financials: {
-            hoursPerDay,
-            basePay,
-            deduction: 0,
-            otMultiplier: 1,
-            otHours: 0,
-            otAmount: 0,
-            finalDayEarning
-          },
-          status: 'Present',
-          metadata: {
-            lastUpdatedBy: req.userId,
-            source: 'correction_approval'
-          },
-          updatedAt: new Date()
-        }
-      },
-      { upsert: true, new: true }
-    );
-    
-    res.json({ 
-      message: 'Correction request approved and attendance updated',
+    // Load existing record to PRESERVE any admin-added deductions and OT
+    // Old code wiped these — a zero deduction/OT was written unconditionally
+    let record = await AttendanceLog.findOne({ empId: correctionRequest.empId, date: dateObj });
+
+    if (!record) {
+      // No existing record — create a minimal one
+      record = new AttendanceLog({
+        empId:      correctionRequest.empId,
+        date:       dateObj,
+        empNumber:  employee.employeeNumber,
+        empName:    `${employee.firstName} ${employee.lastName}`,
+        department: employee.department,
+        shift:      employee.shift,
+        hourlyRate: employee.hourlyRate
+      });
+    }
+
+    // Apply only the corrected fields
+    if (correctionRequest.correctionType === 'In' || correctionRequest.correctionType === 'Both') {
+      record.inOut = { ...(record.inOut?.toObject?.() || record.inOut || {}), in: correctionRequest.correctedInTime };
+    }
+    if (correctionRequest.correctionType === 'Out' || correctionRequest.correctionType === 'Both') {
+      record.inOut = { ...(record.inOut?.toObject?.() || record.inOut || {}), out: correctionRequest.correctedOutTime };
+    }
+
+    // Recompute hours + basePay with the new times
+    const inTime  = record.inOut?.in;
+    const outTime = record.inOut?.out;
+
+    if (inTime && outTime) {
+      const hours   = calcHours(inTime, outTime);
+      const base    = hours * employee.hourlyRate;
+
+      // Preserve existing deduction + OT — only update hours/base/final
+      const existingDeduction = record.financials?.deduction  || 0;
+      const existingOtAmount  = record.financials?.otAmount   || 0;
+
+      record.financials = {
+        ...(record.financials?.toObject?.() || record.financials || {}),
+        hoursWorked:      hours,           // correct field (not hoursPerDay)
+        scheduledHours:   shiftHours(employee.shift),
+        basePay:          base,
+        finalDayEarning:  Math.max(0, base - existingDeduction + existingOtAmount)
+      };
+
+      // Re-evaluate status — corrected times may change Late → Present
+      record.status = toMin(inTime) > toMin(record.shift?.start || employee.shift.start)
+        ? 'Late' : 'Present';
+    }
+
+    record.manualOverride          = false;
+    record.metadata = {
+      ...(record.metadata?.toObject?.() || record.metadata || {}),
+      source:         'correction_approval',
+      lastUpdatedBy:  req.userId,
+      lastModifiedAt: new Date()
+    };
+
+    await record.save();
+
+    return res.json({
+      success:    true,
+      message:    'Correction approved and attendance updated',
       correctionRequest,
-      updatedAttendance: attendance
+      updatedAttendance: record
     });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// **Admin: Reject correction request**
-router.patch('/correction/:requestId/reject', auth, async (req, res) => {
+// ─── PATCH /api/requests/correction/:requestId/reject  (admin) ───────────────
+
+router.patch('/correction/:requestId/reject', adminAuth, async (req, res) => {
   try {
-    if (req.role !== 'admin') {
-      return res.status(403).json({ message: 'Unauthorized' });
-    }
-    
     const { reason } = req.body;
-    const correctionRequest = await CorrectionRequest.findById(req.params.requestId);
-    if (!correctionRequest) return res.status(404).json({ message: 'Request not found' });
-    
-    correctionRequest.status = 'Rejected';
-    correctionRequest.rejectionReason = reason;
+
+    const correctionRequest = await CorrectionRequest.findOne({
+      _id: req.params.requestId, isDeleted: false
+    });
+    if (!correctionRequest) {
+      return res.status(404).json({ success: false, message: 'Correction request not found' });
+    }
+    if (correctionRequest.status !== 'Pending') {
+      return res.status(400).json({ success: false, message: `Request already ${correctionRequest.status.toLowerCase()}` });
+    }
+
+    correctionRequest.status          = 'Rejected';
+    correctionRequest.approvedBy      = req.userId;
+    correctionRequest.approvedAt      = new Date();
+    correctionRequest.rejectionReason = reason || 'Rejected by admin';
     await correctionRequest.save();
-    
-    res.json({ message: 'Correction request rejected', correctionRequest });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+
+    return res.json({ success: true, message: 'Correction request rejected', correctionRequest });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 

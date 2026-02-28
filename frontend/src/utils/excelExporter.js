@@ -1,60 +1,97 @@
 /**
- * Excel Exporter Utility
- * Exports data to Excel format using SheetJS
- * Note: Requires npm install xlsx
+ * utils/excelExporter.js
+ * Excel (XLSX) export helpers.
+ * Requires: npm install xlsx
  */
 
-export function exportToExcel(data, sheetName = 'Sheet1', fileName = 'export.xlsx') {
+import { PAYROLL_CSV_COLUMNS } from './constants.js';
+
+// ─── generic exporter ────────────────────────────────────────────────────────
+
+/**
+ * Export any array of objects to a downloadable .xlsx file.
+ *
+ * @param {Object[]} data
+ * @param {string}   sheetName
+ * @param {string}   fileName
+ */
+export async function exportToExcel(data, sheetName = 'Sheet1', fileName = 'export.xlsx') {
+  if (!data?.length) {
+    console.warn('exportToExcel: no data');
+    return;
+  }
+
   try {
-    // Dynamic import for optional dependency
-    const XLSX = require('xlsx');
+    // Dynamic import — works in Vite/ESM (no require())
+    const XLSX = await import('xlsx').then(m => m.default || m);
 
-    if (!data || data.length === 0) {
-      console.warn('No data to export');
-      return;
-    }
-
-    // Create workbook
     const ws = XLSX.utils.json_to_sheet(data);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
 
-    // Style headers
-    const range = XLSX.utils.decode_range(ws['!ref']);
-    for (let col = range.s.c; col <= range.e.c; col++) {
-      const address = XLSX.utils.encode_cell({ r: 0, c: col });
-      ws[address].s = {
-        fill: { fgColor: { rgb: 'FFD9D9D9' } },
-        font: { bold: true },
+    // Bold headers + background
+    const range = XLSX.utils.decode_range(ws['!ref'] || 'A1');
+    for (let c = range.s.c; c <= range.e.c; c++) {
+      const addr = XLSX.utils.encode_cell({ r: 0, c });
+      if (!ws[addr]) continue;
+      ws[addr].s = {
+        fill:      { fgColor: { rgb: 'FFD9D9D9' } },
+        font:      { bold: true },
         alignment: { horizontal: 'center', vertical: 'center' }
       };
     }
 
     // Auto-width columns
-    const colWidths = [];
-    const headerRow = data[0];
-    for (let key in headerRow) {
-      colWidths.push({ wch: Math.max(key.length, String(headerRow[key]).length) + 2 });
-    }
-    ws['!cols'] = colWidths;
+    ws['!cols'] = Object.keys(data[0]).map(key => ({
+      wch: Math.max(key.length, ...data.map(r => String(r[key] ?? '').length)) + 2
+    }));
 
-    // Download
     XLSX.writeFile(wb, fileName);
-  } catch (error) {
-    console.error('Excel export error:', error);
-    alert('Failed to export to Excel. Make sure xlsx is installed: npm install xlsx');
+  } catch (err) {
+    console.error('exportToExcel error:', err);
+    throw new Error('Excel export failed. Run: npm install xlsx');
   }
 }
 
-export function exportPayrollToExcel(summary) {
-  const data = summary.map(emp => ({
-    'Employee Number': emp.empNumber,
-    'Name': emp.name,
-    'Basic Earned': emp.basicEarned.toFixed(2),
-    'OT Total': emp.otTotal.toFixed(2),
-    'Deductions': emp.deductionTotal.toFixed(2),
-    'Net Payable': emp.netPayable.toFixed(2)
+// ─── payroll export ───────────────────────────────────────────────────────────
+
+/**
+ * Export payroll summary to Excel.
+ * Uses PAYROLL_CSV_COLUMNS from constants.js — correct backend field names.
+ *
+ * @param {Object[]} summary — employee payroll rows from backend
+ */
+export async function exportPayrollToExcel(summary) {
+  if (!summary?.length) return;
+
+  const rows = summary.map(emp =>
+    Object.fromEntries(
+      PAYROLL_CSV_COLUMNS.map(({ key, label }) => [label, emp[key] ?? ''])
+    )
+  );
+
+  await exportToExcel(rows, 'Payroll', `payroll-${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
+// ─── attendance export ────────────────────────────────────────────────────────
+
+export async function exportAttendanceToExcel(attendance, filename = 'attendance.xlsx') {
+  if (!attendance?.length) return;
+
+  const rows = attendance.map(r => ({
+    'Date':       r.dateFormatted || r.date,
+    'Emp Number': r.empNumber,
+    'Name':       r.empName,
+    'Department': r.department,
+    'Status':     r.status,
+    'In Time':    r.inTime  || '--',
+    'Out Time':   r.outTime || '--',
+    'Hours':      r.financials?.hoursWorked    ?? 0,  // correct field
+    'Base Pay':   r.financials?.basePay         ?? 0,
+    'Deduction':  r.financials?.deduction       ?? 0,
+    'OT Amount':  r.financials?.otAmount        ?? 0,
+    'Final Pay':  r.financials?.finalDayEarning ?? 0
   }));
 
-  exportToExcel(data, 'Payroll', `payroll-${new Date().toISOString().split('T')[0]}.xlsx`);
+  await exportToExcel(rows, 'Attendance', filename);
 }

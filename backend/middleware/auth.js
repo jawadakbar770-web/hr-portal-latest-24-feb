@@ -1,101 +1,106 @@
+// middleware/auth.js
+
 import jwt from 'jsonwebtoken';
 import Employee from '../models/Employee.js';
 
-// Generic auth - gets role from token
+// ─── shared token → user resolution ──────────────────────────────────────────
+
+/**
+ * Verify the Bearer token, load the employee from DB, attach to req.
+ * Returns the employee on success, or sends the error response and returns null.
+ */
+async function resolveUser(req, res) {
+  const token = req.headers.authorization?.split(' ')[1];
+
+  if (!token) {
+    res.status(401).json({ success: false, message: 'No token provided' });
+    return null;
+  }
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    const message = err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token';
+    res.status(401).json({ success: false, message });
+    return null;
+  }
+
+  const user = await Employee.findById(decoded.id).select('-password -tempPassword');
+
+  if (!user || user.isDeleted) {
+    res.status(401).json({ success: false, message: 'User not found' });
+    return null;
+  }
+
+  // Frozen accounts cannot access anything
+  if (user.status === 'Frozen') {
+    res.status(403).json({ success: false, message: 'Account is frozen. Contact admin.' });
+    return null;
+  }
+
+  // Role is the source of truth from the DB, not the token payload.
+  // Token role is kept for quick reads but DB always wins.
+  req.user   = user;
+  req.userId = String(user._id);
+  req.role   = user.role;   // 'admin' | 'employee'
+
+  return user;
+}
+
+// ─── middleware functions ─────────────────────────────────────────────────────
+
+/**
+ * auth — any authenticated user (admin or active employee).
+ */
 async function auth(req, res, next) {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ message: 'No token provided' });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await Employee.findById(decoded.id);
-
-    if (!user || user.isDeleted) {
-      return res.status(401).json({ message: 'User not found' });
-    }
-
-    req.user = user;
-    req.userId = decoded.id;
-    req.role = decoded.role || (user.department === 'Manager' ? 'admin' : 'employee');
-    
+    const user = await resolveUser(req, res);
+    if (!user) return;
     next();
-  } catch (error) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({ message: 'Token expired' });
-    }
-    res.status(401).json({ message: 'Invalid token' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Auth error', error: err.message });
   }
 }
 
-// Admin-only endpoints
+/**
+ * adminAuth — authenticated AND role === 'admin'.
+ */
 async function adminAuth(req, res, next) {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ message: 'No token provided' });
+    const user = await resolveUser(req, res);
+    if (!user) return;
+
+    if (user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Admin access required' });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await Employee.findById(decoded.id);
-
-    if (!user || user.isDeleted) {
-      return res.status(401).json({ message: 'User not found' });
-    }
-
-    // Enforce: Must be admin
-    const role = decoded.role || (user.department === 'Manager' ? 'admin' : 'employee');
-    
-    // if (role !== 'admin') {
-      // return res.status(403).json({ message: 'Admin access required' });
-    // }
-
-    req.user = user;
-    req.userId = decoded.id;
-    req.role = role;
-    
     next();
-  } catch (error) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({ message: 'Token expired' });
-    }
-    res.status(401).json({ message: 'Invalid token' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Auth error', error: err.message });
   }
 }
 
-// Employee-only endpoints
+/**
+ * employeeAuth — authenticated AND (role === 'employee' with Active status).
+ * Admins are intentionally blocked here; use `auth` if both should be allowed.
+ */
 async function employeeAuth(req, res, next) {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ message: 'No token provided' });
+    const user = await resolveUser(req, res);
+    if (!user) return;
+
+    if (user.role !== 'employee') {
+      return res.status(403).json({ success: false, message: 'Employee access required' });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await Employee.findById(decoded.id);
-
-    if (!user || user.isDeleted) {
-      return res.status(401).json({ message: 'User not found' });
+    if (user.status !== 'Active') {
+      return res.status(403).json({ success: false, message: 'Account is not active' });
     }
 
-    // Enforce: Must be employee and active OR admin
-    const role = decoded.role || (user.department === 'Manager' ? 'admin' : 'employee');
-    
-    if (!(role === 'employee' && user.status === 'Active') && role !== 'admin') {
-      return res.status(403).json({ message: 'Employee access required' });
-    }
-
-    req.user = user;
-    req.userId = decoded.id;
-    req.role = role;
-    
     next();
-  } catch (error) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({ message: 'Token expired' });
-    }
-    res.status(401).json({ message: 'Invalid token' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Auth error', error: err.message });
   }
 }
 

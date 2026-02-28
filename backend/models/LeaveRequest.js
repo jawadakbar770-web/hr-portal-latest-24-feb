@@ -1,3 +1,5 @@
+// models/LeaveRequest.js
+
 import mongoose from 'mongoose';
 
 const leaveRequestSchema = new mongoose.Schema({

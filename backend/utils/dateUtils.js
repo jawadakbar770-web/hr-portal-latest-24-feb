@@ -1,112 +1,164 @@
 /**
- * E:\hr-employee-portal\backend\utils\dateUtils.js
- * Date Utility Functions
- * Centralized logic for dd/mm/yyyy consistency across the project.
+ * utils/dateUtils.js
+ * Centralized date utility functions.
+ * All API inputs and CSV dates flow through here for consistent parsing.
  */
 
+// ─── parseDDMMYYYY ────────────────────────────────────────────────────────────
 /**
- * Standard Parser: Converts dd/mm/yyyy string to a Date object at 00:00:00 local time.
- * Use this for API inputs and processing CSV dates.
- * Alias 'parseDate' provided for compatibility with csvParser.js
+ * Parse a date string to a Date object at 00:00:00 local time.
+ *
+ * Accepts:
+ *   dd/mm/yyyy          — primary format (API inputs, CSV dates)
+ *   YYYY-MM-DD          — ISO 8601 fallback (HTML date inputs, query params)
+ *   YYYY-MM-DDTHH:mm:ss — ISO datetime (MongoDB returns, JSON payloads)
+ *
+ * Returns null for any invalid or unparseable input.
  */
 export function parseDDMMYYYY(dateStr) {
   if (!dateStr) return null;
 
-  const trimmed = String(dateStr).trim();
-  const parts = trimmed.split('/');
+  const s = String(dateStr).trim();
 
-  if (parts.length !== 3) return null;
-
-  const day = parseInt(parts[0], 10);
-  const month = parseInt(parts[1], 10) - 1; // 0-based index
-  const year = parseInt(parts[2], 10);
-
-  if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
-  if (year < 1900 || year > 2100) return null;
-
-  const date = new Date(year, month, day);
-
-  // Validation: Ensure the date is real (e.g., stops 31/02/2024)
-  if (
-    date.getFullYear() !== year ||
-    date.getMonth() !== month ||
-    date.getDate() !== day
-  ) {
-    return null;
+  // ── dd/mm/yyyy ────────────────────────────────────────────────────────────
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
+    const [d, m, y] = s.split('/').map(Number);
+    const month = m - 1;  // 0-based
+    if (y < 1900 || y > 2100) return null;
+    const date = new Date(y, month, d, 0, 0, 0, 0);
+    // Validate: guards against 31/02/2024 etc.
+    if (date.getFullYear() !== y || date.getMonth() !== month || date.getDate() !== d) {
+      return null;
+    }
+    return date;
   }
 
-  date.setHours(0, 0, 0, 0);
-  return date;
+  // ── YYYY-MM-DD  or  YYYY-MM-DDTHH:mm… ────────────────────────────────────
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    const [y, m, d] = s.slice(0, 10).split('-').map(Number);
+    const month = m - 1;
+    if (y < 1900 || y > 2100) return null;
+    const date = new Date(y, month, d, 0, 0, 0, 0);
+    if (date.getFullYear() !== y || date.getMonth() !== month || date.getDate() !== d) {
+      return null;
+    }
+    return date;
+  }
+
+  return null;
 }
 
-// Alias for csvParser.js compatibility
+/** Alias used by csvParser.js */
 export const parseDate = parseDDMMYYYY;
 
+// ─── formatDate ───────────────────────────────────────────────────────────────
 /**
- * Standard Formatter: Converts Date object to dd/mm/yyyy string.
- * Use this for displaying dates in grids, lists, and calendar inputs.
+ * Format a Date (or date string) to "dd/mm/yyyy".
+ * Used for grid display, CSV export, and API responses.
  */
 export function formatDate(date) {
   if (!date) return '';
   const d = new Date(date);
   if (isNaN(d.getTime())) return '';
-
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-
-  return `${day}/${month}/${year}`;
+  return [
+    String(d.getDate()).padStart(2, '0'),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    d.getFullYear()
+  ].join('/');
 }
 
+// ─── formatDateTimeForDisplay ─────────────────────────────────────────────────
 /**
- * DateTime Formatter: Converts Date object to dd/mm/yyyy HH:mm string.
- * Use this for "Last Modified" or "Created At" columns in your grids.
+ * Format a Date to "dd/mm/yyyy HH:mm".
+ * Used for "Last Modified" and "Created At" columns.
  */
 export function formatDateTimeForDisplay(date) {
   if (!date) return '';
   const d = new Date(date);
   if (isNaN(d.getTime())) return '';
+  return [
+    String(d.getDate()).padStart(2, '0'),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    d.getFullYear()
+  ].join('/') + ' ' + [
+    String(d.getHours()).padStart(2, '0'),
+    String(d.getMinutes()).padStart(2, '0')
+  ].join(':');
+}
 
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-  const hours = String(d.getHours()).padStart(2, '0');
-  const minutes = String(d.getMinutes()).padStart(2, '0');
-
-  return `${day}/${month}/${year} ${hours}:${minutes}`;
+// ─── startOfDay / endOfDay ────────────────────────────────────────────────────
+/**
+ * Return a copy of the date with time set to 00:00:00.000.
+ * Use this before storing dates in MongoDB to keep the compound index
+ * { empId, date } consistent.
+ */
+export function startOfDay(date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  return d;
 }
 
 /**
- * Get Today's Date as a string in dd/mm/yyyy format.
+ * Return a copy of the date with time set to 23:59:59.999.
+ * Use this as the upper bound in date-range queries.
  */
+export function endOfDay(date) {
+  const d = new Date(date);
+  d.setHours(23, 59, 59, 999);
+  return d;
+}
+
+// ─── buildDateRange ───────────────────────────────────────────────────────────
+/**
+ * Parse a start/end pair (any supported format) and return a MongoDB-ready
+ * range object: { $gte: startOfDay, $lte: endOfDay }.
+ *
+ * Returns null if either date is invalid.
+ *
+ * Usage in routes:
+ *   const range = buildDateRange(req.query.startDate, req.query.endDate);
+ *   if (!range) return res.status(400).json({ message: 'Invalid date range' });
+ *   AttendanceLog.find({ date: range });
+ */
+export function buildDateRange(startStr, endStr) {
+  const start = parseDDMMYYYY(startStr);
+  const end   = parseDDMMYYYY(endStr);
+  if (!start || !end) return null;
+  if (end < start)    return null;
+  return { $gte: startOfDay(start), $lte: endOfDay(end) };
+}
+
+// ─── convenience helpers ──────────────────────────────────────────────────────
+
+/** Today's date as "dd/mm/yyyy" */
 export function getTodayDate() {
   return formatDate(new Date());
 }
 
 /**
- * Get a past or future date relative to today in dd/mm/yyyy format.
- * Useful for default "From" values in date range calendars.
+ * Date N days before today as "dd/mm/yyyy".
+ * Useful for default "From" values in date-range pickers.
  */
 export function getDateMinusDays(days) {
-  const date = new Date();
-  date.setDate(date.getDate() - days);
-  return formatDate(date);
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return formatDate(d);
 }
 
-/**
- * Format timestamp for last modified display
- */
+/** Alias kept for backward compatibility */
 export function formatLastModified(dateString) {
-  if (!dateString) return '--';
-  return formatDateTimeForDisplay(dateString);
+  return dateString ? formatDateTimeForDisplay(dateString) : '--';
 }
 
-// Export object for compatibility with existing imports:
+// ─── default export ───────────────────────────────────────────────────────────
 export default {
   parseDDMMYYYY,
   parseDate,
   formatDate,
   formatDateTimeForDisplay,
+  startOfDay,
+  endOfDay,
+  buildDateRange,
   getTodayDate,
   getDateMinusDays,
   formatLastModified

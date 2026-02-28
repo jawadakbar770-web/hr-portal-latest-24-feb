@@ -1,56 +1,62 @@
-/**
- * CSV Validation Middleware
- * Validates CSV file before processing
- */
+// middleware/csvValidator.js
+
+const MAX_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+
+// Some browsers/OS send these MIME types for .csv files
+const VALID_MIME_TYPES = new Set([
+  'text/csv',
+  'text/plain',
+  'application/csv',
+  'application/vnd.ms-excel',       // Windows Excel sometimes sends this for .csv
+  'application/octet-stream'        // fallback when MIME detection fails
+]);
 
 export function validateCSVFile(req, res, next) {
   try {
     if (!req.file) {
       return res.status(400).json({
-        message: 'No CSV file provided',
-        error: 'CSV_FILE_MISSING',
-        success: false
+        success: false,
+        error:   'CSV_FILE_MISSING',
+        message: 'No CSV file provided'
       });
     }
 
-    // Check file type
-    const validTypes = ['text/csv', 'text/plain', 'application/csv'];
-    const isValidType = validTypes.includes(req.file.mimetype) || 
-                        req.file.originalname.endsWith('.csv');
-    
-    if (!isValidType) {
+    const { mimetype, originalname, size } = req.file;
+
+    // Accept if MIME is known-valid OR filename ends in .csv
+    const mimeOk = VALID_MIME_TYPES.has(mimetype);
+    const nameOk = originalname?.toLowerCase().endsWith('.csv');
+
+    if (!mimeOk && !nameOk) {
       return res.status(400).json({
-        message: 'Invalid file type. Please upload a CSV file.',
-        error: 'INVALID_FILE_TYPE',
-        success: false
+        success: false,
+        error:   'INVALID_FILE_TYPE',
+        message: 'Invalid file type. Please upload a .csv file.'
       });
     }
 
-    // Check file size (max 5MB)
-    const maxSize = 5 * 1024 * 1024;
-    if (req.file.size > maxSize) {
+    if (size === 0) {
       return res.status(400).json({
-        message: 'File size exceeds 5MB limit',
-        error: 'FILE_SIZE_EXCEEDED',
-        success: false
+        success: false,
+        error:   'FILE_EMPTY',
+        message: 'The uploaded CSV file is empty.'
       });
     }
 
-    // Check file is not empty
-    if (req.file.size === 0) {
+    if (size > MAX_SIZE_BYTES) {
       return res.status(400).json({
-        message: 'CSV file is empty',
-        error: 'FILE_EMPTY',
-        success: false
+        success: false,
+        error:   'FILE_TOO_LARGE',
+        message: `File size (${(size / 1024 / 1024).toFixed(1)} MB) exceeds the 5 MB limit.`
       });
     }
 
     next();
-  } catch (error) {
+  } catch (err) {
     res.status(500).json({
-      message: 'Error validating CSV file',
-      error: error.message,
-      success: false
+      success: false,
+      error:   'CSV_VALIDATION_ERROR',
+      message: err.message
     });
   }
 }

@@ -1,5 +1,6 @@
-import mongoose from 'mongoose';
+// models/AttendanceLog.js
 
+import mongoose from 'mongoose';
 
 const deductionDetailSchema = new mongoose.Schema({
   amount: { type: Number, required: true, min: 0 },
@@ -17,11 +18,17 @@ const otDetailSchema = new mongoose.Schema({
 }, { _id: false });
 
 const attendanceLogSchema = new mongoose.Schema({
+  /**
+   * For normal shifts: this is the calendar date of check-in.
+   * For night shifts: this is the calendar date when the shift STARTS
+   * (even if the employee checks out the next calendar day).
+   */
   date: {
     type: Date,
     required: true,
     index: true
   },
+
   empId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Employee',
@@ -47,45 +54,63 @@ const attendanceLogSchema = new mongoose.Schema({
     default: 'Absent',
     index: true
   },
+
   inOut: {
     in: {
       type: String,
       validate: {
-        validator: function(v) {
+        validator: function (v) {
           if (!v) return true;
           return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v);
         },
-        message: 'Invalid time format'
+        message: 'Invalid time format (HH:mm expected)'
       }
     },
     out: {
       type: String,
       validate: {
-        validator: function(v) {
+        validator: function (v) {
           if (!v) return true;
           return /^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(v);
         },
-        message: 'Invalid time format'
+        message: 'Invalid time format (HH:mm expected)'
       }
-    }
-  },
-  shift: {
-    start: {
-      type: String,
-      required: true
     },
-    end: {
-      type: String,
-      required: true
+    /**
+     * outNextDay: true means the "out" time belongs to the NEXT calendar day.
+     * Used for night-shift employees whose check-out crosses midnight.
+     * CSV import sets this automatically via the 14-hour window rule.
+     */
+    outNextDay: {
+      type: Boolean,
+      default: false
     }
   },
+
+  shift: {
+    start: { type: String, required: true },   // e.g. "22:00"
+    end:   { type: String, required: true },   // e.g. "06:00" — can be next-day
+    /**
+     * isNightShift: true when shift.end < shift.start (crosses midnight).
+     * Computed and stored on save so queries can filter efficiently.
+     */
+    isNightShift: { type: Boolean, default: false }
+  },
+
   hourlyRate: {
     type: Number,
     required: true,
     min: 0
   },
+
   financials: {
-    hoursPerDay: {
+    hoursWorked: {
+      type: Number,
+      default: 0,
+      min: 0
+    },
+    // Scheduled shift duration in hours (e.g. 8h for a 22:00–06:00 shift)
+    scheduledHours: {
       type: Number,
       default: 0,
       min: 0
@@ -123,16 +148,22 @@ const attendanceLogSchema = new mongoose.Schema({
       type: [otDetailSchema],
       default: []
     },
+    /**
+     * finalDayEarning = basePay - deduction + otAmount
+     * Always recomputed on save; do NOT set this manually.
+     */
     finalDayEarning: {
       type: Number,
       default: 0,
       min: 0
     }
   },
+
   manualOverride: {
     type: Boolean,
     default: false
   },
+
   metadata: {
     source: {
       type: String,
@@ -147,36 +178,40 @@ const attendanceLogSchema = new mongoose.Schema({
       default: Date.now
     }
   },
-  isDeleted: {
-    type: Boolean,
-    default: false,
-    index: true
-  },
-  createdAt: {
-    type: Date,
-    default: Date.now,
-    index: true
-  },
-  updatedAt: {
-    type: Date,
-    default: Date.now,
-    index: true
-  }
-}, { 
-  timestamps: true
+
+  isDeleted: { type: Boolean, default: false, index: true }
+}, {
+  timestamps: true   // adds createdAt + updatedAt automatically
 });
 
-// Compound index to ensure one record per employee per date
+// ─── Compound index: one record per employee per shift-start date ─────────────
 attendanceLogSchema.index({ empId: 1, date: 1 }, { unique: true });
 
-// Pre-save hook to update lastModifiedAt
-attendanceLogSchema.pre('save', function(next) {
+// ─── Pre-save: auto-detect night shift & recompute finalDayEarning ────────────
+attendanceLogSchema.pre('save', function (next) {
+  // 1. Detect night shift (shift end is earlier than shift start)
+  if (this.shift?.start && this.shift?.end) {
+    const [sh, sm] = this.shift.start.split(':').map(Number);
+    const [eh, em] = this.shift.end.split(':').map(Number);
+    this.shift.isNightShift = eh * 60 + em < sh * 60 + sm;
+  }
+
+  // 2. Recompute finalDayEarning so it's always consistent
+  const f = this.financials;
+  if (f) {
+    f.finalDayEarning = Math.max(
+      0,
+      (f.basePay || 0) - (f.deduction || 0) + (f.otAmount || 0)
+    );
+  }
+
+  // 3. Touch lastModifiedAt
   if (this.isModified() && this.metadata) {
     this.metadata.lastModifiedAt = new Date();
   }
+
   next();
 });
 
 const AttendanceLog = mongoose.model('AttendanceLog', attendanceLogSchema);
-
 export default AttendanceLog;

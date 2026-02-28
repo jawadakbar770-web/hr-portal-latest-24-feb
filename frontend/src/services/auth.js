@@ -1,40 +1,33 @@
 /**
- * Auth Service
- * Handles authentication logic (Vercel-ready)
+ * services/auth.js
+ *
+ * All auth calls go through the central apiClient (services/api.js).
+ * No manual fetch(), no duplicate URL logic, no process.env.
  */
 
-const getApiUrl = (path) => {
-  return process.env.REACT_APP_API_URL
-    ? `${process.env.REACT_APP_API_URL}${path}`
-    : `${window.location.origin}/api${path}`;
-};
+import apiClient from './api.js';
 
+// ─── login ────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/auth/login
+ * Stores token + user in localStorage on success.
+ */
 export async function login(email, password) {
-  try {
-    const response = await fetch(getApiUrl('/auth/login'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
-    });
+  const { data } = await apiClient.post('/auth/login', { email, password });
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Login failed');
-    }
-
-    const { token, user } = await response.json();
-
-    if (!user.role) throw new Error('No role assigned. Contact administrator.');
-
-    localStorage.setItem('token', token);
-    localStorage.setItem('user', JSON.stringify(user));
-    localStorage.setItem('role', user.role);
-
-    return { token, user };
-  } catch (error) {
-    throw error;
+  if (!data.user?.role) {
+    throw new Error('No role assigned. Contact administrator.');
   }
+
+  localStorage.setItem('token', data.token);
+  localStorage.setItem('user',  JSON.stringify(data.user));
+  localStorage.setItem('role',  data.user.role);
+
+  return { token: data.token, user: data.user };
 }
+
+// ─── logout ───────────────────────────────────────────────────────────────────
 
 export function logout() {
   localStorage.removeItem('token');
@@ -42,10 +35,10 @@ export function logout() {
   localStorage.removeItem('role');
 }
 
+// ─── local checks (no network) ───────────────────────────────────────────────
+
 export function isAuthenticated() {
-  const token = localStorage.getItem('token');
-  const user = localStorage.getItem('user');
-  return !!token && !!user;
+  return !!localStorage.getItem('token') && !!localStorage.getItem('user');
 }
 
 export function getRole() {
@@ -53,76 +46,79 @@ export function getRole() {
 }
 
 export function getUser() {
-  const user = localStorage.getItem('user');
-  return user ? JSON.parse(user) : null;
+  const raw = localStorage.getItem('user');
+  try {
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
+// ─── token validation ─────────────────────────────────────────────────────────
+
+/**
+ * GET /api/auth/validate-token
+ * Backend route is GET (not POST) — uses the auth middleware to verify the JWT.
+ * Returns true if the token is still valid, false otherwise.
+ */
 export async function validateToken() {
   try {
-    const token = localStorage.getItem('token');
-    if (!token) return false;
+    if (!localStorage.getItem('token')) return false;
 
-    const response = await fetch(getApiUrl('/auth/validate-token'), {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-    });
+    const { data } = await apiClient.get('/auth/validate-token');
 
-    if (!response.ok) return false;
-
-    const data = await response.json();
-
+    // Keep stored role in sync with DB in case it changed
     if (data.role) localStorage.setItem('role', data.role);
+    if (data.user) localStorage.setItem('user', JSON.stringify(data.user));
 
-    return data.valid;
+    return !!data.valid;
   } catch {
     return false;
   }
 }
 
-export async function changePassword(newPassword) {
-  try {
-    const token = localStorage.getItem('token');
-    const response = await fetch(getApiUrl('/auth/change-password'), {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ newPassword }),
-    });
+// ─── change password ──────────────────────────────────────────────────────────
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Failed to change password');
-    }
-
-    return await response.json();
-  } catch (error) {
-    throw error;
-  }
+/**
+ * POST /api/auth/change-password
+ * Requires both currentPassword and newPassword (backend enforces this).
+ */
+export async function changePassword(currentPassword, newPassword) {
+  const { data } = await apiClient.post('/auth/change-password', {
+    currentPassword,
+    newPassword
+  });
+  return data;
 }
 
-// ✅ Fixed employee onboarding URL
-export async function employeeOnboard(data) {
-  try {
-    const response = await fetch(getApiUrl('/auth/employee-onboard'), { // <-- FIXED
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(data),
-    });
+// ─── employee onboarding ──────────────────────────────────────────────────────
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Onboarding failed');
-    }
+/**
+ * POST /api/auth/employee-onboard
+ * Called when a new employee clicks the invite link and sets up their account.
+ *
+ * @param {{ token, firstName, lastName, password, bankDetails }} payload
+ */
+export async function employeeOnboard(payload) {
+  const { data } = await apiClient.post('/auth/employee-onboard', payload);
 
-    return await response.json();
-  } catch (error) {
-    throw error;
+  // Auto-login: store credentials returned by the backend
+  if (data.token && data.user) {
+    localStorage.setItem('token', data.token);
+    localStorage.setItem('user',  JSON.stringify(data.user));
+    localStorage.setItem('role',  data.user.role);
   }
+
+  return data;
 }
+
+export default {
+  login,
+  logout,
+  isAuthenticated,
+  getRole,
+  getUser,
+  validateToken,
+  changePassword,
+  employeeOnboard,
+};
