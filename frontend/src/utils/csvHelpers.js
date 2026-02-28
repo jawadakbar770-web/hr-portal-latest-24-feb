@@ -112,9 +112,11 @@ export function formatCSVProcessingLog(logs) {
     .join('\n');
 }
 
-export default {
+const csvHelpers = {
   generateCSVTemplate,
   downloadCSVTemplate,
   validateCSVFormat,
   formatCSVProcessingLog
 };
+
+export default csvHelpers;

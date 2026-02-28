@@ -68,7 +68,8 @@ export async function getAttendanceRange(fromDate, toDate) {
   }
 }
 
-export default {
+const csvService ={
   uploadCSVFile,
   getAttendanceRange
 };
+export default csvService;

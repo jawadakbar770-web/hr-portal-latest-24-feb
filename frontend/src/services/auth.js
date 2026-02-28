@@ -112,7 +112,7 @@ export async function employeeOnboard(payload) {
   return data;
 }
 
-export default {
+const authh  = {
   login,
   logout,
   isAuthenticated,
@@ -122,3 +122,4 @@ export default {
   changePassword,
   employeeOnboard,
 };
+export default authh

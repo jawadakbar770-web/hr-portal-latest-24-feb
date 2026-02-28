@@ -136,7 +136,7 @@ export function defaultDateRange(daysBack = 30) {
   };
 }
 
-export default {
+const dateFormatter = {
   parseDate,
   formatDate,
   formatDateTime,
@@ -149,3 +149,4 @@ export default {
   toISO,
   defaultDateRange
 };
+export default dateFormatter;
