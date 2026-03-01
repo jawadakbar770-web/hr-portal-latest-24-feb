@@ -1,15 +1,6 @@
-/**
- * App.jsx
- *
- * - Wraps the entire tree in <AuthProvider> + <NotificationProvider>
- *   so useAuth() / useNotification() work everywhere.
- * - Root "/" redirect reads from AuthContext (not raw localStorage).
- * - Layout wrappers use useWindowSize() hook instead of duplicating
- *   resize logic.
- */
-
 import React, { useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { Toaster } from 'react-hot-toast';   // ← ADD THIS
 
 // ── Providers ──────────────────────────────────────────────────────────────
 import { AuthProvider, useAuth }             from './context/AuthContext.js';
@@ -51,7 +42,6 @@ function AppLayout({ Sidebar, children }) {
     <div className="flex h-screen bg-gray-100">
       <Sidebar isOpen={sidebarOpen} isMobile={isMobile} />
 
-      {/* Mobile overlay */}
       {isMobile && sidebarOpen && (
         <div
           className="fixed inset-0 bg-black bg-opacity-50 z-20"
@@ -105,17 +95,14 @@ function EmployeeLayoutWrapper() {
   );
 }
 
-// ─── Root redirect (reads from AuthContext, not raw localStorage) ─────────────
+// ─── Root redirect ────────────────────────────────────────────────────────────
 
 function RootRedirect() {
   const { user, role, loading } = useAuth();
-
-  if (loading) return null;   // AuthProvider is still validating token
-
+  if (loading) return null;
   if (user && role) {
     return <Navigate to={role === 'admin' || role === 'superadmin' ? '/admin/dashboard' : '/employee/dashboard'} replace />;
   }
-
   return <Navigate to="/login" replace />;
 }
 
@@ -126,16 +113,35 @@ export default function App() {
     <AuthProvider>
       <NotificationProvider>
         <Router>
+
+          {/* ── Toaster: render ONCE here, inside Router so navigate works in toasts ── */}
+          <Toaster
+            position="top-right"
+            toastOptions={{
+              duration: 4000,
+              style: {
+                borderRadius: '8px',
+                fontSize: '14px',
+              },
+              success: {
+                iconTheme: { primary: '#2563eb', secondary: '#fff' },
+              },
+              error: {
+                iconTheme: { primary: '#dc2626', secondary: '#fff' },
+              },
+            }}
+          />
+
           <Routes>
             {/* Public */}
-            <Route path="/login"        element={<Login />} />
-            <Route path="/join/:token"  element={<EmployeeOnboarding />} />
+            <Route path="/login"       element={<Login />} />
+            <Route path="/join/:token" element={<EmployeeOnboarding />} />
 
             {/* Admin — protected */}
             <Route
               path="/admin/*"
               element={
-                <ProtectedRoute requiredRole={["admin", "superadmin"]} >
+                <ProtectedRoute requiredRole={['admin', 'superadmin']}>
                   <AdminLayoutWrapper />
                 </ProtectedRoute>
               }
@@ -155,6 +161,7 @@ export default function App() {
             <Route path="/"  element={<RootRedirect />} />
             <Route path="*"  element={<Navigate to="/" replace />} />
           </Routes>
+
         </Router>
       </NotificationProvider>
     </AuthProvider>

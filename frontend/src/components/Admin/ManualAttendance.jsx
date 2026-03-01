@@ -9,10 +9,20 @@ import { getDateMinusDays, getTodayDate, parseDate } from '../../utils/dateForma
 
 const PRIVILEGED_ROLES = ['admin', 'superadmin'];
 
+// ─── resolve current user role — always read from the user object in
+//     localStorage so it stays in sync with what the server issued.
+function getCurrentUserRole() {
+  try {
+    const user = JSON.parse(localStorage.getItem('user') || '{}');
+    return user.role || localStorage.getItem('role') || '';
+  } catch {
+    return localStorage.getItem('role') || '';
+  }
+}
+
 // ─── Attendance Form Modal (Add & Edit) ──────────────────────────────────────
 function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess, currentUserRole }) {
-  const isEdit       = mode === 'edit';
-  const isSuperAdmin = currentUserRole === 'superadmin';
+  const isEdit        = mode === 'edit';
   const hiddenDateRef = useRef(null);
 
   const [form, setForm] = useState({
@@ -27,10 +37,10 @@ function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess, 
   });
 
   const [deductionDraft, setDeductionDraft] = useState({ amount: '', reason: '' });
-  const [otDraft, setOtDraft]               = useState({ type: 'calc', amount: '', hours: '', rate: '1.5', reason: '' });
-  const [employees, setEmployees]           = useState([]);
+  const [otDraft,        setOtDraft]        = useState({ type: 'calc', amount: '', hours: '', rate: '1.5', reason: '' });
+  const [employees,      setEmployees]      = useState([]);
   const [loadingEmployees, setLoadingEmployees] = useState(false);
-  const [saving, setSaving]                 = useState(false);
+  const [saving,         setSaving]         = useState(false);
 
   useEffect(() => {
     if (!isEdit) {
@@ -38,8 +48,8 @@ function AttendanceFormModal({ mode = 'add', record = null, onClose, onSuccess, 
       const token = localStorage.getItem('token');
       axios.get('/api/employees?status=Active', { headers: { Authorization: `Bearer ${token}` } })
         .then(res => {
-          let list = res.data?.employees || res.data || [];
-          // Admins cannot add attendance for admin/superadmin accounts
+          let list = res.data?.employees || [];
+          // admin can only add attendance for regular employees
           if (currentUserRole === 'admin') {
             list = list.filter(emp => !PRIVILEGED_ROLES.includes(emp.role));
           }
@@ -305,7 +315,6 @@ export default function ManualAttendance() {
   const [toDate,          setToDate]          = useState(getTodayDate());
   const [showImportModal, setShowImportModal] = useState(false);
   const [refreshing,      setRefreshing]      = useState(false);
-  const [isMobile,        setIsMobile]        = useState(false);
 
   const hiddenFromDateRef = useRef(null);
   const hiddenToDateRef   = useRef(null);
@@ -314,16 +323,11 @@ export default function ManualAttendance() {
   const [editRecord,   setEditRecord]   = useState(null);
   const [detailsModal, setDetailsModal] = useState(null);
 
-  const userRole     = localStorage.getItem('role');
+  // Always derive role from the user object — not from the bare 'role' key
+  // which may be stale after a role change without re-login.
+  const userRole     = getCurrentUserRole();
   const isSuperAdmin = userRole === 'superadmin';
   const isAdmin      = userRole === 'admin' || isSuperAdmin;
-
-  useEffect(() => {
-    setIsMobile(window.innerWidth < 768);
-    const handleResize = () => setIsMobile(window.innerWidth < 768);
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
 
   const fetchAttendance = useCallback(async () => {
     setLoading(true);
@@ -338,13 +342,11 @@ export default function ManualAttendance() {
 
       let records = response.data?.attendance || [];
 
-      // Admins cannot view attendance of admin/superadmin accounts
-      // (The employee's role may be embedded in the attendance record, or we filter by empRole)
+      // superadmin records are already excluded by the backend (populate match filter).
+      // admin should only see employee attendance — filter out any admin/superadmin
+      // records using the empRole field the backend now returns.
       if (userRole === 'admin') {
-        records = records.filter(r =>
-          !PRIVILEGED_ROLES.includes(r.empRole) &&
-          !PRIVILEGED_ROLES.includes(r.role)
-        );
+        records = records.filter(r => !PRIVILEGED_ROLES.includes(r.empRole));
       }
 
       setAttendance(records);
@@ -384,11 +386,12 @@ export default function ManualAttendance() {
     setter(`${d}/${m}/${y}`);
   };
 
-  // Guard: admin cannot edit attendance of a privileged account
+  // Guard: admin cannot edit attendance of another admin/superadmin
+  // empRole is now returned by the backend on each attendance record
   const canEditRecord = (record) => {
     if (isSuperAdmin) return true;
     if (userRole === 'admin') {
-      return !PRIVILEGED_ROLES.includes(record.empRole) && !PRIVILEGED_ROLES.includes(record.role);
+      return !PRIVILEGED_ROLES.includes(record.empRole);
     }
     return false;
   };

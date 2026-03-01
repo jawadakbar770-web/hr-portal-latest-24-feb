@@ -11,6 +11,19 @@ import { formatDate, formatDateTimeForDisplay, parseDDMMYYYY } from '../utils/da
 
 const router = express.Router();
 
+// ─── Only superadmin is login-only — excluded from attendance/payroll logic ───
+// admin is a full payroll employee and is included everywhere.
+const SYSTEM_ROLES = ['superadmin'];
+
+// Helper: base Employee filter that always excludes superadmin accounts
+const payrollEmployeeFilter = (extra = {}) => ({
+  role: { $nin: SYSTEM_ROLES },   // excludes only superadmin
+  status: 'Active',
+  isArchived: false,
+  isDeleted: false,
+  ...extra
+});
+
 // ─── multer ───────────────────────────────────────────────────────────────────
 
 const upload = multer({
@@ -111,9 +124,9 @@ function buildFinancials({
   otHours = 0, otMultiplier = 1, otDetails = [],
   deduction = 0, deductionDetails = []
 }) {
-  let hoursWorked   = 0;
-  let scheduledHrs  = shiftHours(shift);
-  let basePay       = 0;
+  let hoursWorked  = 0;
+  let scheduledHrs = shiftHours(shift);
+  let basePay      = 0;
 
   if (status === 'Leave') {
     hoursWorked = scheduledHrs;
@@ -193,10 +206,12 @@ router.post(
 
       log.push({ type: 'INFO', message: `✓ Parsed ${parsed.length} valid row(s)` });
 
-      // Pre-load all referenced employees in one query to avoid N+1
+      // Pre-load all referenced employees in one query to avoid N+1.
+      // Only superadmin is excluded — admin is a valid payroll participant.
       const empNumbers = [...new Set(parsed.map(r => r.empId))];
       const employees  = await Employee.find({
         employeeNumber: { $in: empNumbers },
+        role: { $nin: SYSTEM_ROLES },   // excludes superadmin only
         isDeleted: false
       }).lean();
       const empMap = Object.fromEntries(employees.map(e => [e.employeeNumber, e]));
@@ -211,26 +226,22 @@ router.post(
 
         const employee = empMap[empId];
         if (!employee) {
-          log.push({ type: 'WARN', message: `  ⚠️ Employee #${empId} not found. Skipped.` });
+          log.push({ type: 'WARN', message: `  ⚠️ Employee #${empId} not found or is a superadmin account. Skipped.` });
           rowsSkipped += rows.length;
           continue;
         }
 
         // ── apply 14-hour pairing rule (req #4) ──────────────────────────────
-        // Pass ALL punch times for this group to the pairing function.
-        // It will correctly handle night-shift crossings.
         const punchTimes = rows.map(r => r.time).filter(Boolean);
-        const merged     = mergeTimes(rows);   // csvParser groups in/out if already typed
+        const merged     = mergeTimes(rows);
 
         let inTime, outTime, outNextDay;
 
-        // If csvParser already has typed IN/OUT use them; otherwise apply 14-h rule
         if (merged.inTime || merged.outTime) {
           inTime     = merged.inTime;
           outTime    = merged.outTime;
           outNextDay = merged.outNextDay || false;
         } else {
-          // Raw punch list — apply 14-h window from shift start
           ({ inTime, outTime, outNextDay } = applyNightShiftPairing(employee.shift.start, punchTimes));
         }
 
@@ -262,22 +273,21 @@ router.post(
             status,
             inOut:         { in: inTime || null, out: outTime || null, outNextDay: outNextDay || false },
             shift: {
-              start:       employee.shift.start,
-              end:         employee.shift.end,
+              start:        employee.shift.start,
+              end:          employee.shift.end,
               isNightShift: toMin(employee.shift.end) < toMin(employee.shift.start)
             },
             hourlyRate:    employee.hourlyRate,
             financials,
-            manualOverride: false,          // CSV is not a manual override
+            manualOverride: false,
             metadata: {
-              source:        'csv',
-              lastUpdatedBy: req.userId,
+              source:         'csv',
+              lastUpdatedBy:  req.userId,
               lastModifiedAt: new Date()
             }
           };
 
           if (existing) {
-            // Preserve any existing manual deductions / OT added by admin
             if (existing.manualOverride) {
               log.push({ type: 'WARN', message: `  ⚠️ Skipped — record has manual override. Use save-row to update.` });
               rowsSkipped += rows.length;
@@ -342,28 +352,43 @@ router.get('/range', adminAuth, async (req, res) => {
 
     to.setHours(23, 59, 59, 999);
 
+    // Scope by caller role:
+    //   superadmin -> sees admin + employee records (excludes only superadmin)
+    //   admin      -> sees employee records only    (excludes admin + superadmin)
+    const populateRoleMatch = req.userRole === 'superadmin'
+      ? { role: { $nin: ['superadmin'] } }
+      : { role: 'employee' };
+
     const records = await AttendanceLog.find({
       date: { $gte: from, $lte: to },
       isDeleted: false
     })
-      .populate('empId', 'firstName lastName email employeeNumber shift')
+      .populate({
+        path:   'empId',
+        select: 'firstName lastName email employeeNumber shift role',
+        match:  populateRoleMatch
+      })
       .sort({ date: -1, empNumber: 1 })
       .lean();
 
-    const attendance = records.map(r => ({
-      ...r,
-      dateFormatted: formatDate(r.date),
-      inTime:        r.inOut?.in   || '--',
-      outTime:       r.inOut?.out  || '--',
-      outNextDay:    r.inOut?.outNextDay || false,
-      financials: {
-        ...r.financials,
-        deductionDetails: r.financials?.deductionDetails || [],
-        otDetails:        r.financials?.otDetails        || []
-      },
-      lastModified:    r.metadata?.lastModifiedAt ? formatDateTimeForDisplay(r.metadata.lastModifiedAt) : '--',
-      lastModifiedRaw: r.metadata?.lastModifiedAt || null
-    }));
+    // Filter out records where populate returned null (superadmin only)
+    const attendance = records
+      .filter(r => r.empId != null)
+      .map(r => ({
+        ...r,
+        empRole:       r.empId?.role || 'employee',   // ← exposed so frontend can gate by role
+        dateFormatted: formatDate(r.date),
+        inTime:        r.inOut?.in   || '--',
+        outTime:       r.inOut?.out  || '--',
+        outNextDay:    r.inOut?.outNextDay || false,
+        financials: {
+          ...r.financials,
+          deductionDetails: r.financials?.deductionDetails || [],
+          otDetails:        r.financials?.otDetails        || []
+        },
+        lastModified:    r.metadata?.lastModifiedAt ? formatDateTimeForDisplay(r.metadata.lastModifiedAt) : '--',
+        lastModifiedRaw: r.metadata?.lastModifiedAt || null
+      }));
 
     return res.json({ success: true, attendance, total: attendance.length });
   } catch (err) {
@@ -372,7 +397,8 @@ router.get('/range', adminAuth, async (req, res) => {
 });
 
 // ─── POST /api/attendance/worksheet ──────────────────────────────────────────
-// Generates a full grid: every active employee × every working day in range.
+// Generates a full grid: every PAYROLL employee × every working day in range.
+// Only superadmin is excluded. admin appears alongside regular employees.
 // Virtual rows (no DB record yet) are marked isVirtual: true.
 
 router.post('/worksheet', adminAuth, async (req, res) => {
@@ -392,16 +418,16 @@ router.post('/worksheet', adminAuth, async (req, res) => {
 
     end.setHours(23, 59, 59, 999);
 
-    // ── load employees once ───────────────────────────────────────────────────
-    const employees = await Employee.find({
-      status: 'Active', isArchived: false, isDeleted: false
-    }).sort({ employeeNumber: 1 }).lean();
+    // ── load payroll employees (admin + employee, excludes superadmin) ─────────
+    const employees = await Employee.find(
+      payrollEmployeeFilter()
+    ).sort({ employeeNumber: 1 }).lean();
 
     if (employees.length === 0) {
       return res.json({ success: true, worksheet: [], total: 0 });
     }
 
-    // ── load ALL attendance for the range in ONE query (fix N+1) ─────────────
+    // ── load ALL attendance for the range in ONE query ────────────────────────
     const empIds = employees.map(e => e._id);
 
     const logs = await AttendanceLog.find({
@@ -446,10 +472,10 @@ router.post('/worksheet', adminAuth, async (req, res) => {
               deductionDetails: existing.financials?.deductionDetails || [],
               otDetails:        existing.financials?.otDetails        || []
             },
-            manualOverride: existing.manualOverride,
-            lastModified:   existing.metadata?.lastModifiedAt
-                              ? formatDateTimeForDisplay(existing.metadata.lastModifiedAt)
-                              : '--',
+            manualOverride:  existing.manualOverride,
+            lastModified:    existing.metadata?.lastModifiedAt
+                               ? formatDateTimeForDisplay(existing.metadata.lastModifiedAt)
+                               : '--',
             lastModifiedRaw: existing.metadata?.lastModifiedAt || null,
             isVirtual:  false,
             isModified: false
@@ -496,6 +522,7 @@ router.post('/worksheet', adminAuth, async (req, res) => {
 
 // ─── POST /api/attendance/save-row ───────────────────────────────────────────
 // Admin edits a single attendance row.
+// Only superadmin cannot be targeted — admin can have attendance records saved.
 // Always recomputes finalDayEarning so the table stays consistent (req #3).
 
 router.post('/save-row', adminAuth, async (req, res) => {
@@ -507,9 +534,20 @@ router.post('/save-row', adminAuth, async (req, res) => {
       deduction, deductionDetails
     } = req.body;
 
-    const employee = await Employee.findById(empId);
+    // Scope by caller role:
+    //   superadmin -> can save attendance for admin + employee
+    //   admin      -> can save attendance for employee only
+    const roleFilter = req.userRole === 'superadmin'
+      ? { role: { $nin: ['superadmin'] } }
+      : { role: 'employee' };
+
+    const employee = await Employee.findOne({ _id: empId, ...roleFilter });
+
     if (!employee) {
-      return res.status(404).json({ success: false, message: 'Employee not found' });
+      return res.status(404).json({
+        success: false,
+        message: 'Employee not found or you do not have permission to edit this account'
+      });
     }
 
     const dateObj = parseDDMMYYYY(date);
@@ -554,31 +592,31 @@ router.post('/save-row', adminAuth, async (req, res) => {
       record = new AttendanceLog({ empId: employee._id, date: dateObj });
     }
 
-    record.empNumber     = employee.employeeNumber;
-    record.empName       = `${employee.firstName} ${employee.lastName}`;
-    record.department    = employee.department;
-    record.status        = status || 'Present';
-    record.inOut         = { in: inTime || null, out: outTime || null, outNextDay: Boolean(outNextDay) };
-    record.shift         = {
-      start:       employee.shift.start,
-      end:         employee.shift.end,
+    record.empNumber      = employee.employeeNumber;
+    record.empName        = `${employee.firstName} ${employee.lastName}`;
+    record.department     = employee.department;
+    record.status         = status || 'Present';
+    record.inOut          = { in: inTime || null, out: outTime || null, outNextDay: Boolean(outNextDay) };
+    record.shift          = {
+      start:        employee.shift.start,
+      end:          employee.shift.end,
       isNightShift: toMin(employee.shift.end) < toMin(employee.shift.start)
     };
-    record.hourlyRate    = employee.hourlyRate;
-    record.financials    = financials;
+    record.hourlyRate     = employee.hourlyRate;
+    record.financials     = financials;
     record.manualOverride = true;
-    record.metadata      = {
+    record.metadata       = {
       ...(record.metadata?.toObject?.() || record.metadata || {}),
       source:         'manual',
       lastUpdatedBy:  req.userId,
       lastModifiedAt: new Date()
     };
 
-    await record.save();   // pre-save hook also recomputes finalDayEarning as safety net
+    await record.save();
 
     return res.json({
-      success: true,
-      message: 'Attendance saved',
+      success:      true,
+      message:      'Attendance saved',
       record,
       lastModified: formatDateTimeForDisplay(new Date())
     });

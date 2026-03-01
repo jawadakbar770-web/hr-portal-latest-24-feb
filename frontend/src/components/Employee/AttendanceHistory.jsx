@@ -1,270 +1,298 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
-import { MoreVertical, AlertCircle, Calendar } from 'lucide-react';
+import { MoreVertical, Calendar, X } from 'lucide-react';
 import toast from 'react-hot-toast';
-import { formatToDDMMYYYY, formatDate } from '../../utils/dateFormatter';
+
+// ── date helpers ──────────────────────────────────────────────────────────────
+
+/** JS Date → "dd/mm/yyyy"  (what /api/payroll/my/summary expects) */
+const toApiDate = (isoStr) => {
+  if (!isoStr) return '';
+  const [y, m, d] = isoStr.split('-');
+  return `${d}/${m}/${y}`;
+};
+
+/** "YYYY-MM-DD" → "dd/mm/yyyy"  (display only) */
+const isoToDisplay = (isoStr) => {
+  if (!isoStr) return '';
+  const [y, m, d] = isoStr.split('-');
+  return `${d}/${m}/${y}`;
+};
+
+/** Default pay-period start: 18th of current (or previous) month */
+const defaultFromDate = () => {
+  const now   = new Date();
+  const day   = now.getDate();
+  const year  = now.getFullYear();
+  const month = now.getMonth();
+  const start = day >= 18
+    ? new Date(year, month,     18)
+    : new Date(year, month - 1, 18);
+  return start.toISOString().split('T')[0];
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+const STATUS_FILTERS = [
+  { key: 'Present', label: 'Present', on: 'bg-green-100 text-green-700',  off: 'bg-gray-100 text-gray-500' },
+  { key: 'Late',    label: 'Late',    on: 'bg-yellow-100 text-yellow-700', off: 'bg-gray-100 text-gray-500' },
+  { key: 'Leave',   label: 'Leave',   on: 'bg-blue-100 text-blue-700',     off: 'bg-gray-100 text-gray-500' },
+  { key: 'Absent',  label: 'Absent',  on: 'bg-red-100 text-red-700',       off: 'bg-gray-100 text-gray-500' },
+  { key: 'OT',      label: 'Has OT',  on: 'bg-purple-100 text-purple-700', off: 'bg-gray-100 text-gray-500' },
+];
+
+const statusBadge = (status) => {
+  const map = {
+    Present: 'bg-green-100 text-green-800',
+    Late:    'bg-yellow-100 text-yellow-800',
+    Leave:   'bg-blue-100 text-blue-800',
+    Absent:  'bg-gray-100 text-gray-700',
+  };
+  return map[status] ?? 'bg-gray-100 text-gray-700';
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default function AttendanceHistory() {
-  const fromDateRef = useRef(null);
-  const toDateRef = useRef(null);
+  const navigate     = useNavigate();
+  const fromDateRef  = useRef(null);
+  const toDateRef    = useRef(null);
+  const menuRef      = useRef(null);
 
-  const formatDateToDisplay = (dateStr) => {
-    if (!dateStr) return '';
-    const [year, month, day] = dateStr.split('-');
-    return `${day}/${month}/${year}`;
-  };
+  const [fromDate, setFromDate] = useState(defaultFromDate);
+  const [toDate,   setToDate]   = useState(() => new Date().toISOString().split('T')[0]);
 
-  const [fromDate, setFromDate] = useState(() => {
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = now.getMonth();
-    const day = now.getDate();
-    let start = new Date(year, month, 18);
-    if (day < 18) {
-      start = new Date(year, month - 1, 18);
-    }
-    return start.toISOString().split('T')[0];
-  });
+  // Which status chips are active (all on by default)
+  const [activeFilters, setActiveFilters] = useState(
+    () => Object.fromEntries(STATUS_FILTERS.map(f => [f.key, true]))
+  );
 
-  const [toDate, setToDate] = useState(new Date().toISOString().split('T')[0]);
-  const [filters, setFilters] = useState({
-    absent: true,
-    leave: true,
-    ot: true,
-    late: true
-  });
-  const [attendanceHistory, setAttendanceHistory] = useState([]);
-  const [filteredHistory, setFilteredHistory] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [openMenuId, setOpenMenuId] = useState(null);
+  const [allRecords,      setAllRecords]      = useState([]);
+  const [filteredRecords, setFilteredRecords] = useState([]);
+  const [loading,         setLoading]         = useState(false);
+  const [openMenuId,      setOpenMenuId]      = useState(null);
 
+  // ── close context menu on outside click ──────────────────────────────────
+  useEffect(() => {
+    const handler = (e) => {
+      if (menuRef.current && !menuRef.current.contains(e.target)) {
+        setOpenMenuId(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  // ── fetch ────────────────────────────────────────────────────────────────
+  // FIX 1: use /api/payroll/my/summary (employeeAuth, auto-scoped to logged-in user)
+  //         instead of /api/attendance/range (adminAuth)
   const fetchAttendance = useCallback(async () => {
     setLoading(true);
     try {
       const token = localStorage.getItem('token');
-      const user = JSON.parse(localStorage.getItem('user'));
 
-      const response = await axios.get('/api/attendance/range', {
+      const response = await axios.get('/api/payroll/my/summary', {
         params: {
-          fromDate: formatToDDMMYYYY(fromDate),
-          toDate: formatToDDMMYYYY(toDate)
+          // FIX 2: correct param names for this route
+          startDate: toApiDate(fromDate),
+          endDate:   toApiDate(toDate),
         },
-        headers: { Authorization: `Bearer ${token}` }
+        headers: { Authorization: `Bearer ${token}` },
       });
 
-      let data = response.data.attendance.filter(a => a.empId?._id === user.id || a.empId === user.id);
-      
-      // Generate missing records as Absent
-      const start = new Date(fromDate);
-      const end = new Date(toDate);
-      const existingDates = new Set(data.map(a => new Date(a.date).toISOString().split('T')[0]));
-
-      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-        const dateStr = d.toISOString().split('T')[0];
-        if (!existingDates.has(dateStr)) {
-          data.push({
-            _id: `missing-${dateStr}`,
-            date: dateStr,
-            status: 'Absent',
-            inOut: { in: null, out: null },
-            financials: { dailyEarning: 0 }
-          });
-        }
-      }
-
-      data.sort((a, b) => new Date(a.date) - new Date(b.date));
-      setAttendanceHistory(data);
-      setLoading(false);
-    } catch (error) {
-      toast.error('Failed to fetch attendance');
+      // dailyBreakdown already contains every day in the range (present + absent)
+      // sorted ascending, with date already formatted as "dd/mm/yyyy" by the API
+      const breakdown = response.data.dailyBreakdown ?? [];
+      setAllRecords(breakdown);
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to fetch attendance');
+    } finally {
       setLoading(false);
     }
   }, [fromDate, toDate]);
 
-  const applyFilters = useCallback(() => {
-    let filtered = attendanceHistory.filter(record => {
-      if (!filters.absent && record.status === 'Absent') return false;
-      if (!filters.leave && record.status === 'Leave') return false;
-      if (!filters.late && record.status === 'Late') return false;
-      if (!filters.ot && record.financials?.otHours > 0) return false;
+  useEffect(() => { fetchAttendance(); }, [fetchAttendance]);
+
+  // ── apply filters ─────────────────────────────────────────────────────────
+  useEffect(() => {
+    const filtered = allRecords.filter((r) => {
+      const status = r.status;
+      // OT filter: show/hide rows that have any OT hours
+      if (!activeFilters.OT && (r.otHours ?? 0) > 0) return false;
+      // Status filters
+      if (status && !activeFilters[status] && status !== undefined) return false;
       return true;
     });
-    setFilteredHistory(filtered);
-  }, [attendanceHistory, filters]);
+    setFilteredRecords(filtered);
+  }, [allRecords, activeFilters]);
 
-  useEffect(() => {
-    fetchAttendance();
-  }, [fetchAttendance]);
+  const toggleFilter = (key) =>
+    setActiveFilters((prev) => ({ ...prev, [key]: !prev[key] }));
 
-  useEffect(() => {
-    applyFilters();
-  }, [applyFilters]);
-
-  const handleShowList = () => {
-    fetchAttendance();
-  };
-
-  const handleToggleFilter = (filterKey) => {
-    setFilters({
-      ...filters,
-      [filterKey]: !filters[filterKey]
-    });
-  };
-
-  const handleLeaveRequest = (date) => {
-    // Navigate to requests page with this date pre-selected
+  // FIX 5: use navigate instead of window.location.href
+  const goToRequest = (type, date) => {
     localStorage.setItem('selectedDate', date);
-    window.location.href = '/employee/requests?type=leave';
+    navigate(`/employee/requests?type=${type}`);
   };
 
-  const handleCorrectionRequest = (date) => {
-    localStorage.setItem('selectedDate', date);
-    window.location.href = '/employee/requests?type=correction';
-  };
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const EmptyState = () => (
+    <div className="py-16 text-center text-gray-400">
+      <Calendar size={40} className="mx-auto mb-3 opacity-40" />
+      <p className="font-medium">No records found</p>
+      <p className="text-sm mt-1">Try adjusting the date range or filters</p>
+    </div>
+  );
 
   return (
     <div className="p-4 md:p-6 bg-gray-50 min-h-screen">
       <h1 className="text-2xl md:text-3xl font-bold text-gray-800 mb-6">Attendance History</h1>
 
-      {/* Filter Section */}
-      <div className="bg-white rounded-lg shadow p-4 md:p-6 mb-6">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
+      {/* ── Filter panel ── */}
+      <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4 md:p-6 mb-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+
+          {/* From date */}
           <div className="relative">
-            <label className="block text-sm font-medium text-gray-700 mb-2">From Date</label>
-            <div 
-              onClick={() => fromDateRef.current.showPicker()}
-              className="flex items-center justify-between w-full px-4 py-2 border border-gray-300 rounded-lg focus-within:ring-2 focus-within:ring-blue-500 cursor-pointer bg-white"
+            <label className="block text-sm font-medium text-gray-700 mb-1">From Date</label>
+            <div
+              onClick={() => fromDateRef.current?.showPicker()}
+              className="flex items-center justify-between w-full px-4 py-2 border border-gray-300 rounded-lg cursor-pointer bg-white hover:border-blue-400 transition"
             >
-              <span className="text-gray-900">{formatDateToDisplay(fromDate)}</span>
-              <Calendar size={18} className="text-gray-400" />
+              <span className="text-gray-800">{isoToDisplay(fromDate)}</span>
+              <Calendar size={16} className="text-gray-400" />
             </div>
             <input
               ref={fromDateRef}
               type="date"
               value={fromDate}
               onChange={(e) => setFromDate(e.target.value)}
-              className="absolute opacity-0 pointer-events-none"
+              className="absolute opacity-0 pointer-events-none inset-0 w-full"
             />
           </div>
+
+          {/* To date */}
           <div className="relative">
-            <label className="block text-sm font-medium text-gray-700 mb-2">To Date</label>
-            <div 
-              onClick={() => toDateRef.current.showPicker()}
-              className="flex items-center justify-between w-full px-4 py-2 border border-gray-300 rounded-lg focus-within:ring-2 focus-within:ring-blue-500 cursor-pointer bg-white"
+            <label className="block text-sm font-medium text-gray-700 mb-1">To Date</label>
+            <div
+              onClick={() => toDateRef.current?.showPicker()}
+              className="flex items-center justify-between w-full px-4 py-2 border border-gray-300 rounded-lg cursor-pointer bg-white hover:border-blue-400 transition"
             >
-              <span className="text-gray-900">{formatDateToDisplay(toDate)}</span>
-              <Calendar size={18} className="text-gray-400" />
+              <span className="text-gray-800">{isoToDisplay(toDate)}</span>
+              <Calendar size={16} className="text-gray-400" />
             </div>
             <input
               ref={toDateRef}
               type="date"
               value={toDate}
-              onChange={(e) => setToDate(e.target.value)}
               min={fromDate}
-              className="absolute opacity-0 pointer-events-none"
+              onChange={(e) => setToDate(e.target.value)}
+              className="absolute opacity-0 pointer-events-none inset-0 w-full"
             />
           </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">Filter</label>
-            <div className="flex gap-2">
-              <label className="flex items-center gap-2 text-sm cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={filters.absent}
-                  onChange={() => handleToggleFilter('absent')}
-                  className="rounded"
-                />
-                Absent
-              </label>
-              <label className="flex items-center gap-2 text-sm cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={filters.leave}
-                  onChange={() => handleToggleFilter('leave')}
-                  className="rounded"
-                />
-                Leave
-              </label>
-            </div>
-          </div>
+
+          {/* Show list button */}
           <div className="flex items-end">
             <button
-              onClick={handleShowList}
-              className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+              onClick={fetchAttendance}
+              className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium"
             >
               Show List
             </button>
           </div>
         </div>
+
+        {/* FIX 6: all filter chips now rendered (late + OT were invisible before) */}
+        <div className="flex flex-wrap gap-2">
+          {STATUS_FILTERS.map((f) => (
+            <button
+              key={f.key}
+              onClick={() => toggleFilter(f.key)}
+              className={`px-3 py-1 rounded-full text-xs font-semibold transition ${
+                activeFilters[f.key] ? f.on : f.off
+              }`}
+            >
+              {activeFilters[f.key] ? null : <span className="mr-1 opacity-60">✕</span>}
+              {f.label}
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* Attendance Table */}
-      <div className="bg-white rounded-lg shadow overflow-hidden">
+      {/* ── Table ── */}
+      <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden" ref={menuRef}>
         {loading ? (
-          <div className="p-12 text-center">Loading...</div>
+          <div className="py-16 text-center text-gray-400">Loading…</div>
+        ) : filteredRecords.length === 0 ? (
+          <EmptyState />
         ) : (
           <>
-            {/* Desktop View */}
+            {/* Desktop */}
             <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-sm">
-                <thead className="bg-gray-100 border-b">
+                <thead className="bg-gray-50 border-b text-gray-600">
                   <tr>
-                    <th className="px-4 py-3 text-left font-semibold">Date</th>
-                    <th className="px-4 py-3 text-left font-semibold">In / Out</th>
-                    <th className="px-4 py-3 text-left font-semibold">Status</th>
-                    <th className="px-4 py-3 text-left font-semibold">Day Earning</th>
-                    <th className="px-4 py-3 text-left font-semibold">Actions</th>
+                    <th className="px-5 py-3 text-left font-semibold">Date</th>
+                    <th className="px-5 py-3 text-left font-semibold">In / Out</th>
+                    <th className="px-5 py-3 text-left font-semibold">Hours</th>
+                    <th className="px-5 py-3 text-left font-semibold">Status</th>
+                    <th className="px-5 py-3 text-left font-semibold">OT Hours</th>
+                    {/* FIX 3: finalDayEarning (not dailyEarning) */}
+                    <th className="px-5 py-3 text-left font-semibold">Day Earning</th>
+                    <th className="px-5 py-3 text-left font-semibold">Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y">
-                  {filteredHistory.map((record) => (
-                    <tr key={record._id} className="hover:bg-gray-50">
-                      <td className="px-4 py-3">{formatDate(record.date)}</td>
-                      <td className="px-4 py-3">
-                        {record.inOut?.in && record.inOut?.out 
-                          ? `${record.inOut.in} / ${record.inOut.out}`
-                          : <span className="text-gray-400">-- / --</span>
-                        }
+                <tbody className="divide-y divide-gray-100">
+                  {filteredRecords.map((record, idx) => (
+                    <tr key={record.dateRaw ?? idx} className="hover:bg-gray-50">
+                      <td className="px-5 py-3 font-medium text-gray-800">
+                        {/* date is already "dd/mm/yyyy" from the API */}
+                        {record.date}
                       </td>
-                      <td className="px-4 py-3">
-                        <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                          record.status === 'Present' ? 'bg-green-100 text-green-800' :
-                          record.status === 'Late' ? 'bg-yellow-100 text-yellow-800' :
-                          record.status === 'Leave' ? 'bg-blue-100 text-blue-800' :
-                          'bg-gray-100 text-gray-800'
-                        }`}>
+                      <td className="px-5 py-3 text-gray-600">
+                        {record.inTime && record.outTime
+                          ? `${record.inTime} / ${record.outTime}`
+                          : <span className="text-gray-400">— / —</span>}
+                      </td>
+                      <td className="px-5 py-3 text-gray-700">
+                        {(record.hoursWorked ?? 0).toFixed(2)}h
+                      </td>
+                      <td className="px-5 py-3">
+                        <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold ${statusBadge(record.status)}`}>
                           {record.status}
                         </span>
                       </td>
-                      <td className="px-4 py-3 font-semibold text-blue-600">
-                        PKR {(record.financials?.dailyEarning || 0).toFixed(2)}
+                      <td className="px-5 py-3 text-purple-700 font-medium">
+                        {(record.otHours ?? 0) > 0 ? `${record.otHours.toFixed(2)}h` : '—'}
                       </td>
-                      <td className="px-4 py-3 relative">
+                      <td className="px-5 py-3 font-semibold text-blue-600">
+                        {/* FIX 3: finalDayEarning (not dailyEarning which doesn't exist) */}
+                        PKR {(record.finalDayEarning ?? 0).toLocaleString('en-PK', { minimumFractionDigits: 2 })}
+                      </td>
+                      <td className="px-5 py-3 relative">
                         <button
-                          onClick={() => setOpenMenuId(openMenuId === record._id ? null : record._id)}
-                          className="text-gray-400 hover:text-gray-600"
+                          onClick={() =>
+                            setOpenMenuId(openMenuId === idx ? null : idx)
+                          }
+                          className="p-1 text-gray-400 hover:text-gray-600 rounded"
                         >
-                          <MoreVertical size={18} />
+                          <MoreVertical size={16} />
                         </button>
-                        {openMenuId === record._id && (
-                          <div className="absolute right-0 mt-2 w-40 bg-white rounded-lg shadow-lg z-40 border border-gray-200">
+                        {openMenuId === idx && (
+                          <div className="absolute right-4 top-10 w-44 bg-white rounded-lg shadow-lg z-40 border border-gray-200">
                             <button
-                              onClick={() => {
-                                handleLeaveRequest(record.date);
-                                setOpenMenuId(null);
-                              }}
-                              className="w-full px-4 py-2 text-left hover:bg-gray-50 text-sm border-b"
+                              onClick={() => { goToRequest('leave', record.date); setOpenMenuId(null); }}
+                              className="w-full px-4 py-2.5 text-left text-sm hover:bg-gray-50 border-b border-gray-100"
                             >
-                              Leave Request
+                              Request Leave
                             </button>
                             <button
-                              onClick={() => {
-                                handleCorrectionRequest(record.date);
-                                setOpenMenuId(null);
-                              }}
-                              className="w-full px-4 py-2 text-left hover:bg-gray-50 text-sm"
+                              onClick={() => { goToRequest('correction', record.date); setOpenMenuId(null); }}
+                              className="w-full px-4 py-2.5 text-left text-sm hover:bg-gray-50"
                             >
-                              Correction Request
+                              Request Correction
                             </button>
                           </div>
                         )}
@@ -275,58 +303,55 @@ export default function AttendanceHistory() {
               </table>
             </div>
 
-            {/* Mobile View */}
-            <div className="md:hidden space-y-4 p-4">
-              {filteredHistory.map((record) => (
-                <div key={record._id} className="bg-gray-50 rounded-lg p-4 border border-gray-200">
-                  <div className="flex justify-between items-start mb-3">
+            {/* Mobile */}
+            <div className="md:hidden divide-y divide-gray-100">
+              {filteredRecords.map((record, idx) => (
+                <div key={record.dateRaw ?? idx} className="p-4">
+                  <div className="flex justify-between items-start mb-2">
                     <div>
-                      <p className="font-semibold text-gray-800">{formatDate(record.date)}</p>
-                      <p className="text-sm text-gray-600">
-                        {record.inOut?.in && record.inOut?.out 
-                          ? `${record.inOut.in} - ${record.inOut.out}`
-                          : 'No record'
-                        }
+                      <p className="font-semibold text-gray-800">{record.date}</p>
+                      <p className="text-sm text-gray-500 mt-0.5">
+                        {record.inTime && record.outTime
+                          ? `${record.inTime} → ${record.outTime}`
+                          : 'No punch record'}
                       </p>
                     </div>
                     <button
-                      onClick={() => setOpenMenuId(openMenuId === record._id ? null : record._id)}
+                      onClick={() => setOpenMenuId(openMenuId === idx ? null : idx)}
+                      className="p-1 text-gray-400"
                     >
-                      <MoreVertical size={18} className="text-gray-400" />
+                      <MoreVertical size={18} />
                     </button>
                   </div>
-                  <div className="flex justify-between items-center">
-                    <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                      record.status === 'Present' ? 'bg-green-100 text-green-800' :
-                      record.status === 'Late' ? 'bg-yellow-100 text-yellow-800' :
-                      record.status === 'Leave' ? 'bg-blue-100 text-blue-800' :
-                      'bg-gray-100 text-gray-800'
-                    }`}>
+
+                  <div className="flex items-center justify-between">
+                    <span className={`px-2.5 py-0.5 rounded-full text-xs font-semibold ${statusBadge(record.status)}`}>
                       {record.status}
                     </span>
-                    <span className="font-semibold text-blue-600">
-                      PKR {(record.financials?.dailyEarning || 0).toFixed(2)}
+                    <span className="font-semibold text-blue-600 text-sm">
+                      PKR {(record.finalDayEarning ?? 0).toLocaleString('en-PK', { minimumFractionDigits: 2 })}
                     </span>
                   </div>
-                  {openMenuId === record._id && (
-                    <div className="mt-3 space-y-2">
+
+                  {(record.otHours ?? 0) > 0 && (
+                    <p className="text-xs text-purple-600 mt-1.5 font-medium">
+                      OT: {record.otHours.toFixed(2)}h
+                    </p>
+                  )}
+
+                  {openMenuId === idx && (
+                    <div className="mt-3 grid grid-cols-2 gap-2">
                       <button
-                        onClick={() => {
-                          handleLeaveRequest(record.date);
-                          setOpenMenuId(null);
-                        }}
-                        className="w-full px-4 py-2 bg-white border border-gray-300 rounded text-sm hover:bg-gray-50"
+                        onClick={() => { goToRequest('leave', record.date); setOpenMenuId(null); }}
+                        className="px-3 py-2 bg-white border border-gray-300 rounded-lg text-sm hover:bg-gray-50 text-center"
                       >
-                        Leave Request
+                        Request Leave
                       </button>
                       <button
-                        onClick={() => {
-                          handleCorrectionRequest(record.date);
-                          setOpenMenuId(null);
-                        }}
-                        className="w-full px-4 py-2 bg-white border border-gray-300 rounded text-sm hover:bg-gray-50"
+                        onClick={() => { goToRequest('correction', record.date); setOpenMenuId(null); }}
+                        className="px-3 py-2 bg-white border border-gray-300 rounded-lg text-sm hover:bg-gray-50 text-center"
                       >
-                        Correction Request
+                        Correction
                       </button>
                     </div>
                   )}

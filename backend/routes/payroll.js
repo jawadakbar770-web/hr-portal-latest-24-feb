@@ -9,15 +9,32 @@ import { isLate, getCompanyMonthDates, getRecentPayPeriods } from '../utils/time
 
 const router = express.Router();
 
-// ─── shared helpers ───────────────────────────────────────────────────────────
+// ─── Only superadmin is login-only — excluded from all payroll/attendance logic
+// admin is a full payroll employee and is included everywhere.
+const SYSTEM_ROLES = ['superadmin'];
 
 /**
- * Accept dd/mm/yyyy OR YYYY-MM-DD for both params.
- * Delegates to the shared buildDateRange so parsing logic lives in one place.
- * Returns { start, end } or null.
+ * Scoped Mongoose filter for payroll-eligible employees.
+ *
+ *   superadmin caller → sees admin + employee  (excludes only superadmin)
+ *   admin caller      → sees employee only     (excludes admin + superadmin)
+ *
+ * Pass callerRole from req.userRole.
  */
+const payrollFilter = (callerRole, extra = {}) => ({
+  role:       callerRole === 'superadmin'
+                ? { $nin: ['superadmin'] }      // admin + employee
+                : 'employee',                    // employee only
+  status:     'Active',
+  isArchived: false,
+  isDeleted:  false,
+  ...extra
+});
+
+// ─── shared helpers ───────────────────────────────────────────────────────────
+
 function parseDateRange(fromDate, toDate) {
-  const range = buildDateRange(fromDate, toDate);  // handles both formats + validation
+  const range = buildDateRange(fromDate, toDate);
   if (!range) return null;
   return { start: range.$gte, end: range.$lte };
 }
@@ -25,7 +42,6 @@ function parseDateRange(fromDate, toDate) {
 const n      = (v) => { const x = Number(v); return isFinite(x) ? x : 0; };
 const round2 = (v) => parseFloat(n(v).toFixed(2));
 
-/** Count Mon–Fri working days between two dates inclusive */
 function workingDaysBetween(start, end) {
   let count = 0;
   for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
@@ -35,10 +51,6 @@ function workingDaysBetween(start, end) {
   return count;
 }
 
-/**
- * Build per-employee payroll totals from their AttendanceLog records.
- * Monthly salary is pro-rated by (presentDays + leaveDays) / workingDays.
- */
 function calcEmployeeTotals(emp, records, workingDays) {
   const presentDays = records.filter(r => r.status === 'Present' || r.status === 'Late').length;
   const leaveDays   = records.filter(r => r.status === 'Leave').length;
@@ -77,10 +89,6 @@ function calcEmployeeTotals(emp, records, workingDays) {
   };
 }
 
-/**
- * Build per-day breakdown rows.
- * Shared by admin detail view and employee salary page — no duplication.
- */
 function buildDailyBreakdown(records) {
   return records.map(r => ({
     date:             formatDate(r.date),
@@ -89,7 +97,7 @@ function buildDailyBreakdown(records) {
     inTime:           r.inOut?.in          || '--',
     outTime:          r.inOut?.out         || '--',
     outNextDay:       r.inOut?.outNextDay  || false,
-    hoursWorked:      round2(n(r.financials?.hoursWorked)),   // correct field (not hoursPerDay)
+    hoursWorked:      round2(n(r.financials?.hoursWorked)),
     basePay:          round2(n(r.financials?.basePay)),
     deduction:        round2(n(r.financials?.deduction)),
     otHours:          round2(n(r.financials?.otHours)),
@@ -101,11 +109,8 @@ function buildDailyBreakdown(records) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// EMPLOYEE ROUTES  (req #7)
-// Registered BEFORE /:empId param routes — prevents Express swallowing /my/*
+// EMPLOYEE ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
-
-// ─── GET /api/payroll/my/periods ─────────────────────────────────────────────
 
 router.get('/my/periods', employeeAuth, async (req, res) => {
   try {
@@ -120,10 +125,6 @@ router.get('/my/periods', employeeAuth, async (req, res) => {
   }
 });
 
-// ─── GET /api/payroll/my/summary  (req #7) ───────────────────────────────────
-// Employee selects a date range and sees their own:
-// baseSalary | deductions | OT | netSalary  +  day-by-day breakdown
-
 router.get('/my/summary', employeeAuth, async (req, res) => {
   try {
     const range = parseDateRange(req.query.startDate, req.query.endDate);
@@ -136,13 +137,15 @@ router.get('/my/summary', employeeAuth, async (req, res) => {
     const { start, end } = range;
 
     const [emp, records] = await Promise.all([
-      Employee.findById(req.userId).lean(),
+      Employee.findOne({ _id: req.userId, role: { $nin: SYSTEM_ROLES } }).lean(),
       AttendanceLog.find({
         empId: req.userId, date: { $gte: start, $lte: end }, isDeleted: false
       }).sort({ date: 1 }).lean()
     ]);
 
-    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+    if (!emp) {
+      return res.status(404).json({ success: false, message: 'Employee not found' });
+    }
 
     const workingDays    = workingDaysBetween(start, end);
     const totals         = calcEmployeeTotals(emp, records, workingDays);
@@ -177,6 +180,9 @@ router.get('/my/summary', employeeAuth, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADMIN ROUTES
+// All admin endpoints use payrollFilter(req.userRole) so:
+//   superadmin -> admin + employee data
+//   admin      -> employee data only
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── POST /api/payroll/attendance-overview ────────────────────────────────────
@@ -189,7 +195,7 @@ router.post('/attendance-overview', adminAuth, async (req, res) => {
     const { start, end } = range;
 
     const [employees, allLogs] = await Promise.all([
-      Employee.find({ status: 'Active', isArchived: false, isDeleted: false }).lean(),
+      Employee.find(payrollFilter(req.userRole)).lean(),
       AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false }).lean()
     ]);
 
@@ -250,7 +256,7 @@ router.post('/attendance-overview', adminAuth, async (req, res) => {
   }
 });
 
-// ─── POST /api/payroll/performance-overview  (req #2) ─────────────────────────
+// ─── POST /api/payroll/performance-overview ───────────────────────────────────
 
 router.post('/performance-overview', adminAuth, async (req, res) => {
   try {
@@ -260,7 +266,7 @@ router.post('/performance-overview', adminAuth, async (req, res) => {
     const { start, end } = range;
 
     const [employees, allLogs] = await Promise.all([
-      Employee.find({ status: 'Active', isArchived: false, isDeleted: false }).lean(),
+      Employee.find(payrollFilter(req.userRole)).lean(),
       AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false }).lean()
     ]);
 
@@ -322,7 +328,7 @@ router.post('/performance-overview', adminAuth, async (req, res) => {
   }
 });
 
-// ─── POST /api/payroll/salary-summary  (req #1) ───────────────────────────────
+// ─── POST /api/payroll/salary-summary ────────────────────────────────────────
 
 router.post('/salary-summary', adminAuth, async (req, res) => {
   try {
@@ -332,7 +338,7 @@ router.post('/salary-summary', adminAuth, async (req, res) => {
     const { start, end } = range;
 
     const [employees, allLogs] = await Promise.all([
-      Employee.find({ status: 'Active', isArchived: false, isDeleted: false }).lean(),
+      Employee.find(payrollFilter(req.userRole)).lean(),
       AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false }).lean()
     ]);
 
@@ -370,7 +376,7 @@ router.post('/report', adminAuth, async (req, res) => {
     const { start, end } = range;
 
     const [employees, allLogs] = await Promise.all([
-      Employee.find({ status: 'Active', isArchived: false, isDeleted: false })
+      Employee.find(payrollFilter(req.userRole))
         .sort({ firstName: 1, lastName: 1 }).lean(),
       AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false })
         .sort({ date: 1 }).lean()
@@ -394,7 +400,7 @@ router.post('/report', adminAuth, async (req, res) => {
         const records = logsByEmp[String(emp._id)] || [];
         return {
           ...calcEmployeeTotals(emp, records, workingDays),
-          dailyAttendance: buildDailyBreakdown(records)  // shared helper, no duplication
+          dailyAttendance: buildDailyBreakdown(records)
         };
       });
 
@@ -419,14 +425,24 @@ router.get('/employee-breakdown/:empId', adminAuth, async (req, res) => {
     if (!range) return res.status(400).json({ success: false, message: 'Invalid date range' });
     const { start, end } = range;
 
+    // Scope: superadmin can view admin or employee breakdown; admin can only view employees
+    const roleFilter = req.userRole === 'superadmin'
+      ? { role: { $nin: ['superadmin'] } }
+      : { role: 'employee' };
+
     const [emp, records] = await Promise.all([
-      Employee.findOne({ _id: req.params.empId, isDeleted: false }).lean(),
+      Employee.findOne({ _id: req.params.empId, ...roleFilter, isDeleted: false }).lean(),
       AttendanceLog.find({
         empId: req.params.empId, date: { $gte: start, $lte: end }, isDeleted: false
       }).sort({ date: 1 }).lean()
     ]);
 
-    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+    if (!emp) {
+      return res.status(404).json({
+        success: false,
+        message: 'Employee not found or you do not have permission to view this account'
+      });
+    }
 
     const workingDays    = workingDaysBetween(start, end);
     const empTotals      = calcEmployeeTotals(emp, records, workingDays);
@@ -454,7 +470,7 @@ router.get('/employee-breakdown/:empId', adminAuth, async (req, res) => {
         presentDays:    empTotals.presentDays,
         leaveDays:      empTotals.leaveDays,
         absentDays:     empTotals.absentDays,
-        lateDays:       empTotals.lateDays,    // was missing from original totals object
+        lateDays:       empTotals.lateDays,
         workingDays
       }
     });
@@ -470,8 +486,13 @@ router.get('/live-payroll', adminAuth, async (req, res) => {
     const { startDate, endDate } = getCompanyMonthDates();
     const now = new Date();
 
+    const payrollEmpIds = await Employee.find(payrollFilter(req.userRole))
+      .distinct('_id');
+
     const logs = await AttendanceLog.find({
-      date: { $gte: startDate, $lte: now }, isDeleted: false
+      empId: { $in: payrollEmpIds },
+      date:  { $gte: startDate, $lte: now },
+      isDeleted: false
     }).lean();
 
     const totalPayroll = round2(
@@ -500,7 +521,7 @@ router.post('/export', adminAuth, async (req, res) => {
     const { start, end } = range;
 
     const [employees, allLogs] = await Promise.all([
-      Employee.find({ status: 'Active', isArchived: false, isDeleted: false }).lean(),
+      Employee.find(payrollFilter(req.userRole)).lean(),
       AttendanceLog.find({ date: { $gte: start, $lte: end }, isDeleted: false }).lean()
     ]);
 
@@ -516,7 +537,6 @@ router.post('/export', adminAuth, async (req, res) => {
       .sort((a, b) => a.name.localeCompare(b.name));
 
     if (format === 'csv') {
-      // All columns present — lateDays and OT Hours were missing from original
       const headers = [
         'Employee Number', 'Name', 'Department', 'Salary Type',
         'Working Days', 'Present Days', 'Leave Days', 'Absent Days', 'Late Days',
@@ -524,20 +544,9 @@ router.post('/export', adminAuth, async (req, res) => {
       ];
       const lines = rows.map(e =>
         [
-          e.empNumber,
-          `"${e.name}"`,     // quoted — handles commas in names
-          e.department,
-          e.salaryType,
-          e.workingDays,
-          e.presentDays,
-          e.leaveDays,
-          e.absentDays,
-          e.lateDays,        // was missing
-          e.baseSalary,
-          e.totalOtHours,    // was missing
-          e.totalOt,
-          e.totalDeduction,
-          e.netPayable
+          e.empNumber, `"${e.name}"`, e.department, e.salaryType,
+          e.workingDays, e.presentDays, e.leaveDays, e.absentDays, e.lateDays,
+          e.baseSalary, e.totalOtHours, e.totalOt, e.totalDeduction, e.netPayable
         ].join(',')
       );
 

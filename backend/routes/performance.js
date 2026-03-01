@@ -1,10 +1,4 @@
 // routes/performance.js
-//
-// Admin endpoints (req #2):
-//   GET  /api/performance/summary      — all employees performance table + pie chart data
-//   GET  /api/performance/:empId       — single employee performance detail
-//   POST /api/performance/calculate    — compute + store PerformanceRecords for a range
-//   PATCH /api/performance/:id/score   — admin manual score override
 
 import express from 'express';
 import AttendanceLog     from '../models/AttendanceLog.js';
@@ -16,7 +10,25 @@ import { countWorkingDays } from '../utils/helpers.js';
 
 const router = express.Router();
 
-// ─── shared helper: compute performance from attendance logs ──────────────────
+const SYSTEM_ROLES = ['superadmin'];
+
+/**
+ * Scoped Mongoose filter for payroll-eligible employees.
+ *
+ *   superadmin caller -> admin + employee  (excludes only superadmin)
+ *   admin caller      -> employee only     (excludes admin + superadmin)
+ */
+const payrollFilter = (callerRole, extra = {}) => ({
+  role:       callerRole === 'superadmin'
+                ? { $nin: ['superadmin'] }
+                : 'employee',
+  status:     'Active',
+  isArchived: false,
+  isDeleted:  false,
+  ...extra
+});
+
+// ─── shared helper ────────────────────────────────────────────────────────────
 
 function computePerformance(employee, logs, periodStart, periodEnd, totalWorkingDays) {
   let presentDays = 0, lateDays = 0, absentDays = 0, leaveDays = 0;
@@ -32,7 +44,7 @@ function computePerformance(employee, logs, periodStart, periodEnd, totalWorking
     totalOtHours     += log.financials?.otHours     || 0;
   }
 
-  const total          = totalWorkingDays || 1;
+  const total           = totalWorkingDays || 1;
   const attendanceRate  = Math.min(100, ((presentDays + leaveDays) / total) * 100);
   const onTimeDays      = Math.max(0, presentDays - lateDays);
   const punctualityRate = presentDays > 0 ? (onTimeDays / presentDays) * 100 : 100;
@@ -74,11 +86,7 @@ function computePerformance(employee, logs, periodStart, periodEnd, totalWorking
   };
 }
 
-// ─── GET /api/performance/summary  (admin — req #2) ───────────────────────────
-// Returns:
-//   table[]     — one row per employee (for the data table)
-//   pieData[]   — rating distribution for the pie chart
-//   deptData[]  — avg score per department for the bar/pie chart
+// ─── GET /api/performance/summary ────────────────────────────────────────────
 
 router.get('/summary', adminAuth, async (req, res) => {
   try {
@@ -99,11 +107,18 @@ router.get('/summary', adminAuth, async (req, res) => {
 
     let records = await PerformanceRecord.find(prQuery).lean();
 
+    // If using cached records, filter by caller role so admin doesn't see other admins
+    if (records.length > 0 && req.userRole !== 'superadmin') {
+      // Need to join with Employee to check role — use empId list approach
+      const employeeIds = await Employee.find(payrollFilter(req.userRole))
+        .distinct('_id');
+      const empIdSet = new Set(employeeIds.map(id => String(id)));
+      records = records.filter(r => empIdSet.has(String(r.empId)));
+    }
+
     if (records.length === 0) {
       // Compute live
-      const empQuery = { status: 'Active', isArchived: false, isDeleted: false };
-      if (department) empQuery.department = department;
-
+      const empQuery  = payrollFilter(req.userRole, department ? { department } : {});
       const employees   = await Employee.find(empQuery).lean();
       const workingDays = countWorkingDays(range.$gte, range.$lte);
       const empIds      = employees.map(e => e._id);
@@ -123,7 +138,6 @@ router.get('/summary', adminAuth, async (req, res) => {
       );
     }
 
-    // ── table rows ────────────────────────────────────────────────────────────
     const table = records.map(r => ({
       _id:              r._id || null,
       empId:            r.empId,
@@ -143,7 +157,6 @@ router.get('/summary', adminAuth, async (req, res) => {
       scoreOverride:    r.scoreOverride || false
     }));
 
-    // ── pie chart: rating distribution ───────────────────────────────────────
     const ratingCounts = { Excellent: 0, Good: 0, Average: 0, Poor: 0 };
     for (const r of records) ratingCounts[r.rating] = (ratingCounts[r.rating] || 0) + 1;
 
@@ -153,7 +166,6 @@ router.get('/summary', adminAuth, async (req, res) => {
       percentage: records.length ? Math.round((count / records.length) * 100) : 0
     }));
 
-    // ── bar chart: average score per department ───────────────────────────────
     const deptMap = {};
     for (const r of records) {
       const d = r.department;
@@ -165,7 +177,6 @@ router.get('/summary', adminAuth, async (req, res) => {
       count:      scores.length
     })).sort((a, b) => b.avgScore - a.avgScore);
 
-    // ── overall stats ─────────────────────────────────────────────────────────
     const avgScore = records.length
       ? Math.round(records.reduce((s, r) => s + r.performanceScore, 0) / records.length)
       : 0;
@@ -192,8 +203,7 @@ router.get('/summary', adminAuth, async (req, res) => {
   }
 });
 
-// ─── GET /api/performance/:empId  (admin) ────────────────────────────────────
-// Single employee performance detail with month-by-month trend data.
+// ─── GET /api/performance/:empId ─────────────────────────────────────────────
 
 router.get('/:empId', adminAuth, async (req, res) => {
   try {
@@ -204,14 +214,21 @@ router.get('/:empId', adminAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: 'startDate and endDate required' });
     }
 
-    const employee = await Employee.findOne({ _id: req.params.empId, isDeleted: false })
-      .select('-password -tempPassword').lean();
+    // Scope by caller role
+    const roleFilter = req.userRole === 'superadmin'
+      ? { role: { $nin: ['superadmin'] } }
+      : { role: 'employee' };
+
+    const employee = await Employee.findOne({
+      _id:       req.params.empId,
+      ...roleFilter,
+      isDeleted: false
+    }).select('-password -tempPassword').lean();
 
     if (!employee) {
-      return res.status(404).json({ success: false, message: 'Employee not found' });
+      return res.status(404).json({ success: false, message: 'Employee not found or access denied' });
     }
 
-    // Try cached record
     let record = await PerformanceRecord.findOne({
       empId:       employee._id,
       periodStart: { $lte: range.$lte },
@@ -228,7 +245,6 @@ router.get('/:empId', adminAuth, async (req, res) => {
       record = computePerformance(employee, logs, range.$gte, range.$lte, workingDays);
     }
 
-    // ── trend: last 6 cached periods for this employee ────────────────────────
     const trend = await PerformanceRecord.find({
       empId:     employee._id,
       isDeleted: false
@@ -244,7 +260,7 @@ router.get('/:empId', adminAuth, async (req, res) => {
       attendanceRate:   t.attendanceRate,
       punctualityRate:  t.punctualityRate,
       rating:           t.rating
-    })).reverse();  // chronological order for chart
+    })).reverse();
 
     return res.json({
       success: true,
@@ -279,9 +295,7 @@ router.get('/:empId', adminAuth, async (req, res) => {
   }
 });
 
-// ─── POST /api/performance/calculate  (admin) ────────────────────────────────
-// Compute and store PerformanceRecords for all active employees.
-// Idempotent — re-run to refresh; only overwrites non-overridden records.
+// ─── POST /api/performance/calculate ─────────────────────────────────────────
 
 router.post('/calculate', adminAuth, async (req, res) => {
   try {
@@ -292,9 +306,7 @@ router.post('/calculate', adminAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Valid startDate and endDate required' });
     }
 
-    const employees = await Employee.find({
-      status: 'Active', isArchived: false, isDeleted: false
-    }).lean();
+    const employees = await Employee.find(payrollFilter(req.userRole)).lean();
 
     if (!employees.length) {
       return res.json({ success: true, message: 'No active employees', created: 0, updated: 0 });
@@ -331,7 +343,7 @@ router.post('/calculate', adminAuth, async (req, res) => {
 
       if (existing) {
         if (existing.scoreOverride) {
-          skipped++;  // admin manually set score — don't overwrite
+          skipped++;
         } else {
           Object.assign(existing, data);
           await existing.save();
@@ -357,9 +369,7 @@ router.post('/calculate', adminAuth, async (req, res) => {
   }
 });
 
-// ─── PATCH /api/performance/:id/score  (admin) ───────────────────────────────
-// Admin manually overrides an employee's performance score.
-// Sets scoreOverride=true so re-calculate won't overwrite it.
+// ─── PATCH /api/performance/:id/score ────────────────────────────────────────
 
 router.patch('/:id/score', adminAuth, async (req, res) => {
   try {
@@ -373,11 +383,21 @@ router.patch('/:id/score', adminAuth, async (req, res) => {
     const record = await PerformanceRecord.findOne({ _id: req.params.id, isDeleted: false });
     if (!record) return res.status(404).json({ success: false, message: 'Performance record not found' });
 
+    // Admin cannot override performance scores for other admins/superadmins
+    if (req.userRole !== 'superadmin') {
+      const emp = await Employee.findOne({ _id: record.empId, role: 'employee' });
+      if (!emp) {
+        return res.status(403).json({
+          success: false,
+          message: 'You do not have permission to override scores for admin accounts'
+        });
+      }
+    }
+
     record.performanceScore = numScore;
     record.scoreOverride    = true;
     record.notes            = notes || record.notes;
 
-    // Re-derive rating from new score
     if      (numScore >= 90) record.rating = 'Excellent';
     else if (numScore >= 75) record.rating = 'Good';
     else if (numScore >= 60) record.rating = 'Average';

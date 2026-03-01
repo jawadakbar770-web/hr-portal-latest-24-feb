@@ -16,5 +16,6 @@ dist/
 *~
 coverage/
 .eslintcache
-.package-lock.json
+package-lock.json
 yarn.lock
+**/package-lock.json

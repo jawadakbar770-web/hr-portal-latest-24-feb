@@ -27,6 +27,34 @@ const publicEmployee = (emp) => {
   return obj;
 };
 
+/**
+ * Returns a Mongoose filter scoped to what the requesting role may see.
+ *
+ *   superadmin → sees everyone            (no filter)
+ *   admin      → sees role:'employee' only
+ *
+ * REQUIRES adminAuth to attach req.role.
+ * If req.role is missing/unknown we default to employees-only (safe fallback).
+ */
+const roleVisibilityFilter = (requestingRole) => {
+  if (requestingRole === 'superadmin') return {};
+  return { role: 'employee' };           // admin + unknown → employees only
+};
+
+/**
+ * Resolve which role the new account gets.
+ *   superadmin creator → honours requested role (employee | admin | superadmin)
+ *   admin creator      → always 'employee', ignores what was sent
+ */
+const resolveNewRole = (creatorRole, requestedRole) => {
+  if (creatorRole === 'superadmin') {
+    return ['employee', 'admin', 'superadmin'].includes(requestedRole)
+      ? requestedRole
+      : 'employee';
+  }
+  return 'employee';
+};
+
 // ─── GET /api/employees ───────────────────────────────────────────────────────
 
 router.get('/', adminAuth, async (req, res) => {
@@ -37,16 +65,15 @@ router.get('/', adminAuth, async (req, res) => {
       search,
       includeArchived = 'false',
       page  = 1,
-      limit = 20
+      limit = 200       // high default so frontend gets the full list in one call
     } = req.query;
 
-    const query = { isDeleted: false };
+    const query = {
+      isDeleted: false,
+      ...roleVisibilityFilter(req.role)
+    };
 
-    // By default hide archived employees unless admin explicitly asks
-    if (includeArchived !== 'true') {
-      query.isArchived = false;
-    }
-
+    if (includeArchived !== 'true') query.isArchived = false;
     if (status)     query.status     = status;
     if (department) query.department = department;
 
@@ -59,7 +86,7 @@ router.get('/', adminAuth, async (req, res) => {
       ];
     }
 
-    const skip  = (Number(page) - 1) * Number(limit);
+    const skip = (Number(page) - 1) * Number(limit);
     const [employees, total] = await Promise.all([
       Employee.find(query)
         .select('-password -tempPassword -inviteToken -inviteTokenExpires')
@@ -73,12 +100,7 @@ router.get('/', adminAuth, async (req, res) => {
     return res.json({
       success: true,
       employees,
-      pagination: {
-        total,
-        page:  Number(page),
-        limit: Number(limit),
-        pages: Math.ceil(total / Number(limit))
-      }
+      pagination: { total, page: Number(page), limit: Number(limit), pages: Math.ceil(total / Number(limit)) }
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -91,13 +113,13 @@ router.get('/:id', adminAuth, async (req, res) => {
   try {
     const employee = await Employee.findOne({
       _id:       req.params.id,
-      isDeleted: false
+      isDeleted: false,
+      ...roleVisibilityFilter(req.role)
     }).select('-password -tempPassword -inviteToken -inviteTokenExpires');
 
     if (!employee) {
       return res.status(404).json({ success: false, message: 'Employee not found' });
     }
-
     return res.json({ success: true, employee });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -112,10 +134,10 @@ router.post('/', adminAuth, async (req, res) => {
       email, employeeNumber, firstName, lastName,
       department, joiningDate, shift,
       salaryType, hourlyRate, monthlySalary,
-      bank
+      bank,
+      role: requestedRole    // ← read role from payload
     } = req.body;
 
-    // Basic required-field check
     if (!email || !employeeNumber || !firstName || !lastName || !department || !joiningDate) {
       return res.status(400).json({
         success: false,
@@ -123,52 +145,37 @@ router.post('/', adminAuth, async (req, res) => {
       });
     }
 
-    // Duplicate check must exclude soft-deleted records
-    // (a deleted employee's email/number should be reusable)
+    // Determine actual role for new account
+    const resolvedRole = resolveNewRole(req.role, requestedRole);
+
+    // Duplicate check
     const existing = await Employee.findOne({
       $or: [
         { email: email.toLowerCase().trim() },
         { employeeNumber: employeeNumber.trim() }
       ],
-      isDeleted: false   // ← old code was missing this, so deleted employees blocked re-use
+      isDeleted: false
     });
-
     if (existing) {
-      const field = existing.email === email.toLowerCase().trim()
-        ? 'Email' : 'Employee number';
+      const field = existing.email === email.toLowerCase().trim() ? 'Email' : 'Employee number';
       return res.status(409).json({ success: false, message: `${field} already exists` });
     }
 
-    // Date parsing — accept both dd/mm/yyyy (legacy) and ISO 8601
-    let parsedJoiningDate = parseDDMMYYYY(joiningDate);
-    if (!parsedJoiningDate) {
-      parsedJoiningDate = new Date(joiningDate);
-    }
+    // Date parsing
+    let parsedJoiningDate = parseDDMMYYYY(joiningDate) || new Date(joiningDate);
     if (!parsedJoiningDate || isNaN(parsedJoiningDate)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid joiningDate. Use dd/mm/yyyy or YYYY-MM-DD'
-      });
+      return res.status(400).json({ success: false, message: 'Invalid joiningDate. Use dd/mm/yyyy or YYYY-MM-DD' });
     }
 
-    // salaryType validation
     const resolvedSalaryType = salaryType || 'hourly';
     if (!['hourly', 'monthly'].includes(resolvedSalaryType)) {
-      return res.status(400).json({
-        success: false,
-        message: "salaryType must be 'hourly' or 'monthly'"
-      });
+      return res.status(400).json({ success: false, message: "salaryType must be 'hourly' or 'monthly'" });
     }
-
     if (resolvedSalaryType === 'monthly' && !monthlySalary) {
-      return res.status(400).json({
-        success: false,
-        message: 'monthlySalary is required when salaryType is monthly'
-      });
+      return res.status(400).json({ success: false, message: 'monthlySalary is required when salaryType is monthly' });
     }
 
-    const inviteToken   = generateInviteToken();
-    const inviteExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);  // 7 days
+    const inviteToken = generateInviteToken();
 
     const employee = new Employee({
       email:              email.toLowerCase().trim(),
@@ -176,7 +183,7 @@ router.post('/', adminAuth, async (req, res) => {
       firstName:          firstName.trim(),
       lastName:           lastName.trim(),
       department,
-      role:               'employee',
+      role:               resolvedRole,           // ← NOT hardcoded 'employee' anymore
       joiningDate:        parsedJoiningDate,
       shift:              shift || { start: '09:00', end: '18:00' },
       salaryType:         resolvedSalaryType,
@@ -184,19 +191,17 @@ router.post('/', adminAuth, async (req, res) => {
       monthlySalary:      resolvedSalaryType === 'monthly' ? parseFloat(monthlySalary) : null,
       status:             'Inactive',
       inviteToken,
-      inviteTokenExpires: inviteExpires,
+      inviteTokenExpires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       bank:               bank || {}
     });
 
     await employee.save();
 
-    const inviteLink = constructInviteLink(inviteToken);
-
     return res.status(201).json({
       success:    true,
       message:    'Employee created. Invite link generated.',
       employee:   publicEmployee(employee),
-      inviteLink
+      inviteLink: constructInviteLink(inviteToken)
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -207,7 +212,6 @@ router.post('/', adminAuth, async (req, res) => {
 
 router.put('/:id', adminAuth, async (req, res) => {
   try {
-    // Admin cannot edit their own record via this endpoint
     if (String(req.userId) === String(req.params.id)) {
       return res.status(403).json({
         success: false,
@@ -215,65 +219,52 @@ router.put('/:id', adminAuth, async (req, res) => {
       });
     }
 
-    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false });
-    if (!employee) {
-      return res.status(404).json({ success: false, message: 'Employee not found' });
-    }
+    const employee = await Employee.findOne({
+      _id:       req.params.id,
+      isDeleted: false,
+      ...roleVisibilityFilter(req.role)
+    });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
 
-    // ── scalar fields safe to update ─────────────────────────────────────────
-    const scalarFields = ['firstName', 'lastName', 'department', 'shift', 'bank'];
-    scalarFields.forEach(f => {
+    // Scalar fields
+    ['firstName', 'lastName', 'department', 'shift', 'bank'].forEach(f => {
       if (req.body[f] !== undefined) employee[f] = req.body[f];
     });
 
-    // ── salary fields — keep consistent ──────────────────────────────────────
+    // Only superadmin can change role
+    if (req.body.role !== undefined) {
+      if (req.role === 'superadmin') {
+        if (!['employee', 'admin', 'superadmin'].includes(req.body.role)) {
+          return res.status(400).json({ success: false, message: 'Invalid role' });
+        }
+        employee.role = req.body.role;
+      }
+      // admin sending role → silently ignored (can't escalate)
+    }
+
     if (req.body.salaryType !== undefined) {
       if (!['hourly', 'monthly'].includes(req.body.salaryType)) {
-        return res.status(400).json({
-          success: false,
-          message: "salaryType must be 'hourly' or 'monthly'"
-        });
+        return res.status(400).json({ success: false, message: "salaryType must be 'hourly' or 'monthly'" });
       }
       employee.salaryType = req.body.salaryType;
     }
+    if (req.body.hourlyRate    !== undefined) employee.hourlyRate    = parseFloat(req.body.hourlyRate);
+    if (req.body.monthlySalary !== undefined) employee.monthlySalary = req.body.monthlySalary ? parseFloat(req.body.monthlySalary) : null;
 
-    if (req.body.hourlyRate !== undefined) {
-      employee.hourlyRate = parseFloat(req.body.hourlyRate);
-    }
-
-    if (req.body.monthlySalary !== undefined) {
-      employee.monthlySalary = req.body.monthlySalary
-        ? parseFloat(req.body.monthlySalary) : null;
-    }
-
-    // If switching to monthly but no monthlySalary provided, reject
     if (employee.salaryType === 'monthly' && !employee.monthlySalary) {
-      return res.status(400).json({
-        success: false,
-        message: 'monthlySalary is required when salaryType is monthly'
-      });
+      return res.status(400).json({ success: false, message: 'monthlySalary is required when salaryType is monthly' });
     }
 
-    // ── joining date ──────────────────────────────────────────────────────────
     if (req.body.joiningDate) {
-      let parsed = parseDDMMYYYY(req.body.joiningDate);
-      if (!parsed) parsed = new Date(req.body.joiningDate);
+      const parsed = parseDDMMYYYY(req.body.joiningDate) || new Date(req.body.joiningDate);
       if (!parsed || isNaN(parsed)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Invalid joiningDate. Use dd/mm/yyyy or YYYY-MM-DD'
-        });
+        return res.status(400).json({ success: false, message: 'Invalid joiningDate. Use dd/mm/yyyy or YYYY-MM-DD' });
       }
       employee.joiningDate = parsed;
     }
 
     await employee.save();
-
-    return res.json({
-      success:  true,
-      message:  'Employee updated',
-      employee: publicEmployee(employee)
-    });
+    return res.json({ success: true, message: 'Employee updated', employee: publicEmployee(employee) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -286,28 +277,15 @@ router.patch('/:id/freeze', adminAuth, async (req, res) => {
     if (String(req.userId) === String(req.params.id)) {
       return res.status(403).json({ success: false, message: 'You cannot freeze your own account' });
     }
+    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false, ...roleVisibilityFilter(req.role) });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
 
-    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false });
-    if (!employee) {
-      return res.status(404).json({ success: false, message: 'Employee not found' });
-    }
-
-    // Toggle: Active ↔ Frozen  (Inactive stays Inactive — must be activated first)
     if (employee.status === 'Inactive') {
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot freeze an inactive account. Employee must activate first.'
-      });
+      return res.status(400).json({ success: false, message: 'Cannot freeze an inactive account.' });
     }
-
     employee.status = employee.status === 'Frozen' ? 'Active' : 'Frozen';
     await employee.save();
-
-    return res.json({
-      success: true,
-      message:  `Employee ${employee.status === 'Frozen' ? 'frozen' : 'unfrozen'} successfully`,
-      employee: publicEmployee(employee)
-    });
+    return res.json({ success: true, message: `Employee ${employee.status === 'Frozen' ? 'frozen' : 'unfrozen'}`, employee: publicEmployee(employee) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -320,20 +298,12 @@ router.patch('/:id/archive', adminAuth, async (req, res) => {
     if (String(req.userId) === String(req.params.id)) {
       return res.status(403).json({ success: false, message: 'You cannot archive your own account' });
     }
-
-    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false });
-    if (!employee) {
-      return res.status(404).json({ success: false, message: 'Employee not found' });
-    }
+    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false, ...roleVisibilityFilter(req.role) });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
 
     employee.isArchived = !employee.isArchived;
     await employee.save();
-
-    return res.json({
-      success: true,
-      message:  `Employee ${employee.isArchived ? 'archived' : 'unarchived'}`,
-      employee: publicEmployee(employee)
-    });
+    return res.json({ success: true, message: `Employee ${employee.isArchived ? 'archived' : 'unarchived'}`, employee: publicEmployee(employee) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -343,81 +313,52 @@ router.patch('/:id/archive', adminAuth, async (req, res) => {
 
 router.post('/:id/resend-invite', adminAuth, async (req, res) => {
   try {
-    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false });
-    if (!employee) {
-      return res.status(404).json({ success: false, message: 'Employee not found' });
-    }
-
-    if (employee.status === 'Active') {
-      return res.status(400).json({ success: false, message: 'Employee is already activated' });
-    }
+    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false, ...roleVisibilityFilter(req.role) });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
+    if (employee.status === 'Active') return res.status(400).json({ success: false, message: 'Employee is already activated' });
 
     employee.inviteToken        = generateInviteToken();
     employee.inviteTokenExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await employee.save();
-
-    const inviteLink = constructInviteLink(employee.inviteToken);
-
-    return res.json({ success: true, message: 'Invite resent', inviteLink });
+    return res.json({ success: true, message: 'Invite resent', inviteLink: constructInviteLink(employee.inviteToken) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
 // ─── POST /api/employees/:id/reset-password ───────────────────────────────────
-// Generates a temp password.
-// IMPORTANT: in production this should be emailed — NEVER returned in the API
-// response. We return it here only for development convenience; set
-// RETURN_TEMP_PASSWORD=false in production .env to suppress it.
 
 router.post('/:id/reset-password', adminAuth, async (req, res) => {
   try {
-    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false });
-    if (!employee) {
-      return res.status(404).json({ success: false, message: 'Employee not found' });
-    }
+    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false, ...roleVisibilityFilter(req.role) });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
 
-    // Generate a readable temp password: 4 chars + "-" + 4 chars + "-" + 4 chars
     const seg = () => Math.random().toString(36).slice(2, 6).toUpperCase();
     const tempPassword = `${seg()}-${seg()}-${seg()}`;
-
-    // Store hashed (pre-save hook handles hashing)
     employee.tempPassword = tempPassword;
     await employee.save();
 
-    // In production: email the tempPassword to employee.email here.
-    // Never log or return it unless explicitly enabled for dev.
-    const revealInDev = process.env.NODE_ENV !== 'production' ||
-                        process.env.RETURN_TEMP_PASSWORD === 'true';
-
-    return res.json({
-      success: true,
-      message: 'Temporary password generated. Employee should change it on next login.',
-      ...(revealInDev && { tempPassword })   // only included outside production
-    });
+    const revealInDev = process.env.NODE_ENV !== 'production' || process.env.RETURN_TEMP_PASSWORD === 'true';
+    return res.json({ success: true, message: 'Temporary password generated.', ...(revealInDev && { tempPassword }) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// ─── DELETE /api/employees/:id — soft delete ──────────────────────────────────
+// ─── DELETE /api/employees/:id ────────────────────────────────────────────────
 
 router.delete('/:id', adminAuth, async (req, res) => {
   try {
     if (String(req.userId) === String(req.params.id)) {
       return res.status(403).json({ success: false, message: 'You cannot delete your own account' });
     }
-
-    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false });
-    if (!employee) {
-      return res.status(404).json({ success: false, message: 'Employee not found' });
-    }
+    const employee = await Employee.findOne({ _id: req.params.id, isDeleted: false, ...roleVisibilityFilter(req.role) });
+    if (!employee) return res.status(404).json({ success: false, message: 'Employee not found' });
 
     employee.isDeleted  = true;
     employee.isArchived = true;
     employee.status     = 'Inactive';
     await employee.save();
-
     return res.json({ success: true, message: 'Employee deleted' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

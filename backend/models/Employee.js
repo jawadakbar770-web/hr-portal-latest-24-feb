@@ -3,9 +3,9 @@
 import mongoose from 'mongoose';
 import bcryptjs from 'bcryptjs';
 
-// Roles that are system accounts — not payroll employees.
-// They don't need salary, shift, or hourlyRate.
-const SYSTEM_ROLES = ['admin', 'superadmin'];
+// Only superadmin is a login-only system account.
+// admin is a regular payroll employee (shift + salary required).
+const SYSTEM_ROLES = ['superadmin'];
 
 const employeeSchema = new mongoose.Schema({
   email: {
@@ -39,7 +39,7 @@ const employeeSchema = new mongoose.Schema({
   joiningDate: { type: Date, required: true },
 
   // ── Shift ─────────────────────────────────────────────────────────────────
-  // Optional for admin/superadmin — they are not scheduled employees.
+  // Required for admin + employee. Optional (null) for superadmin only.
   shift: {
     start: {
       type: String,
@@ -60,15 +60,14 @@ const employeeSchema = new mongoose.Schema({
   },
 
   // ── Salary ────────────────────────────────────────────────────────────────
-  // All three fields are optional at the schema level.
-  // A custom validator (below) enforces them only for 'employee' role.
+  // Required for admin + employee. Cleared to null for superadmin only.
   //
   // salaryType:
   //   'hourly'  — paid per hour worked (hourlyRate × hoursWorked)
   //   'monthly' — fixed monthly salary; deductions/OT still applied on top
   //
   // hourlyRate:
-  //   Required for employees. For monthly employees it is derived automatically:
+  //   Required for admin + employee. For monthly employees it is derived:
   //     hourlyRate = monthlySalary / (workingDaysPerMonth × scheduledHoursPerDay)
   //   but an explicit override is also accepted.
   //
@@ -113,11 +112,12 @@ const employeeSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 // ─── Cross-field validation ───────────────────────────────────────────────────
-// Enforce salary + shift only for regular employees.
+// Only superadmin is exempt from salary + shift requirements.
+// admin is validated exactly like a regular employee.
 
 employeeSchema.pre('validate', function (next) {
   if (SYSTEM_ROLES.includes(this.role)) {
-    // System accounts: clear any accidentally-set salary/shift data
+    // superadmin: login-only account — clear salary/shift data
     this.salaryType    = null;
     this.hourlyRate    = null;
     this.monthlySalary = null;
@@ -128,20 +128,20 @@ employeeSchema.pre('validate', function (next) {
     return next();
   }
 
-  // ── Regular employees must have valid salary + shift ──────────────────────
+  // ── admin + employee: must have valid salary + shift ──────────────────────
   const errors = [];
 
-  if (!this.shift?.start) errors.push('shift.start is required for employees');
-  if (!this.shift?.end)   errors.push('shift.end is required for employees');
+  if (!this.shift?.start) errors.push('shift.start is required');
+  if (!this.shift?.end)   errors.push('shift.end is required');
 
   if (!this.salaryType) {
-    errors.push('salaryType is required for employees');
+    errors.push('salaryType is required');
   } else {
     if (!this.hourlyRate || this.hourlyRate <= 0) {
-      errors.push('hourlyRate is required and must be > 0 for employees');
+      errors.push('hourlyRate is required and must be > 0');
     }
     if (this.salaryType === 'monthly' && (!this.monthlySalary || this.monthlySalary <= 0)) {
-      errors.push('monthlySalary is required and must be > 0 for monthly employees');
+      errors.push('monthlySalary is required and must be > 0 for monthly salary type');
     }
   }
 
@@ -192,7 +192,8 @@ employeeSchema.methods.getDaysUntilLeaveEligible = function () {
 
 /**
  * Compute effective hourly rate for payroll calculations.
- * Returns null for system accounts (admin/superadmin) — they are not on payroll.
+ * Returns null for superadmin only — they are not on payroll.
+ * admin is on payroll and returns a real rate.
  *
  * @param {number} workingDaysInPeriod  – actual working days in the payroll period
  * @param {number} scheduledHoursPerDay – hours per scheduled shift (default 8)
@@ -201,7 +202,7 @@ employeeSchema.methods.getEffectiveHourlyRate = function (
   workingDaysInPeriod = 26,
   scheduledHoursPerDay = 8
 ) {
-  if (SYSTEM_ROLES.includes(this.role)) return null;
+  if (SYSTEM_ROLES.includes(this.role)) return null;   // superadmin only
 
   if (this.salaryType === 'monthly' && this.monthlySalary) {
     return this.monthlySalary / (workingDaysInPeriod * scheduledHoursPerDay);
@@ -210,7 +211,8 @@ employeeSchema.methods.getEffectiveHourlyRate = function (
 };
 
 /**
- * Returns true if this account is a system/admin account with no payroll data.
+ * Returns true only for superadmin (login-only, no payroll data).
+ * admin returns false — they are a full payroll participant.
  */
 employeeSchema.methods.isSystemAccount = function () {
   return SYSTEM_ROLES.includes(this.role);

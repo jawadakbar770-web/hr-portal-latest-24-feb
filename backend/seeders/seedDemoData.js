@@ -1,7 +1,10 @@
 // seeders/seedDemoData.js
 //
-// Generates 60 days of realistic attendance for all active employees, then
-// computes and stores PayrollRecord + PerformanceRecord for each month covered.
+// Generates 60 days of realistic attendance for all active payroll participants
+// (role: 'employee' OR role: 'admin'), then computes and stores PayrollRecord +
+// PerformanceRecord for each month covered.
+//
+// superadmin is excluded — login-only, no shift/salary data.
 //
 // Run AFTER seedAdmin.js:
 //   node seeders/seedAdmin.js
@@ -46,7 +49,7 @@ const scheduledHours = (start, end) => {
  * return { inTime, outTime, outNextDay, hoursWorked }.
  *
  * For night-shift employees the out time may be on the next calendar day;
- * we mark that with outNextDay=true (matches new AttendanceLog schema).
+ * we mark that with outNextDay=true (matches AttendanceLog schema).
  */
 const buildInOut = (emp, lateMin = 0) => {
   const shiftStartMin = toMin(emp.shift.start);
@@ -56,9 +59,9 @@ const buildInOut = (emp, lateMin = 0) => {
   const inMin  = shiftStartMin + lateMin;
   const outMin = isNight ? shiftEndMin + 1440 : shiftEndMin; // normalise to same timeline
 
-  const inTime     = fromMin(inMin);
-  const outTime    = fromMin(outMin % 1440);
-  const outNextDay = isNight;                                  // night shift always crosses midnight
+  const inTime      = fromMin(inMin);
+  const outTime     = fromMin(outMin % 1440);
+  const outNextDay  = isNight;                                // night shift always crosses midnight
   const hoursWorked = Math.max(0, (outMin - inMin) / 60);
 
   return { inTime, outTime, outNextDay, hoursWorked };
@@ -75,10 +78,10 @@ const randomStatus = () => {
 
 /** Build a single AttendanceLog document (plain object for insertMany) */
 const buildRecord = (emp, date) => {
-  const status    = randomStatus();
-  const isWorked  = status === 'Present' || status === 'Late';
-  const isLeave   = status === 'Leave';
-  const lateMin   = status === 'Late' ? Math.floor(Math.random() * 45) + 5 : 0;
+  const status   = randomStatus();
+  const isWorked = status === 'Present' || status === 'Late';
+  const isLeave  = status === 'Leave';
+  const lateMin  = status === 'Late' ? Math.floor(Math.random() * 45) + 5 : 0;
 
   // ── In / Out ────────────────────────────────────────────────────────────────
   let inTime = null, outTime = null, outNextDay = false, hoursWorked = 0;
@@ -96,8 +99,8 @@ const buildRecord = (emp, date) => {
   const basePay = hoursWorked * emp.hourlyRate;
 
   // Random small deduction (~20 % chance)
-  const hasDeduction = isWorked && Math.random() < 0.20;
-  const deductionAmt = hasDeduction ? Math.round(emp.hourlyRate * 0.5 * 10) / 10 : 0;
+  const hasDeduction     = isWorked && Math.random() < 0.20;
+  const deductionAmt     = hasDeduction ? Math.round(emp.hourlyRate * 0.5 * 10) / 10 : 0;
   const deductionDetails = hasDeduction
     ? [{ amount: deductionAmt, reason: 'Late deduction', createdAt: new Date() }]
     : [];
@@ -111,7 +114,7 @@ const buildRecord = (emp, date) => {
     ? [{ type: 'calc', amount: otAmount, hours: otHours, rate: otMultiplier, reason: 'After-hours work', createdAt: new Date() }]
     : [];
 
-  // finalDayEarning recomputed in model pre-save, but we set it here too for insertMany
+  // finalDayEarning recomputed in model pre-save, but set here too for insertMany
   const finalDayEarning = Math.max(0, basePay - deductionAmt + otAmount);
 
   return {
@@ -151,10 +154,6 @@ const buildRecord = (emp, date) => {
 
 // ─── payroll & performance builders ──────────────────────────────────────────
 
-/**
- * Aggregate attendance records for one employee + one period into a
- * PayrollRecord and a PerformanceRecord.
- */
 const buildPayrollAndPerf = (emp, records, periodStart, periodEnd, totalWorkingDays) => {
   let presentDays = 0, lateDays = 0, absentDays = 0, leaveDays = 0;
   let totalHoursWorked = 0, totalOtHours = 0;
@@ -188,17 +187,16 @@ const buildPayrollAndPerf = (emp, records, periodStart, periodEnd, totalWorkingD
     });
   }
 
-  // For monthly employees override baseSalary with monthlySalary (pro-rated)
+  // For monthly employees override baseSalary with pro-rated monthlySalary
   let baseSalary = totalBasePay;
   if (emp.salaryType === 'monthly' && emp.monthlySalary) {
-    const daysInMonth = totalWorkingDays || 1;
+    const daysInMonth   = totalWorkingDays || 1;
     const workedOrLeave = presentDays + leaveDays;
     baseSalary = (emp.monthlySalary / daysInMonth) * workedOrLeave;
   }
 
   const netSalary = Math.max(0, baseSalary - totalDeduction + totalOtAmount);
-
-  const label = periodStart.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+  const label     = periodStart.toLocaleString('en-US', { month: 'long', year: 'numeric' });
 
   const payroll = {
     empId:            emp._id,
@@ -287,16 +285,27 @@ async function seedDemoData() {
     await PerformanceRecord.deleteMany({});
     console.log('✓ Cleared attendance / payroll / performance records');
 
-    // ── Load active employees ──────────────────────────────────────────────
-    const employees = await Employee.find({ status: 'Active', isArchived: false, isDeleted: false });
-    console.log(`✓ Found ${employees.length} active employees`);
+    // ── Load all active, non-deleted employees ─────────────────────────────
+    const allEmployees = await Employee.find({
+      status:     'Active',
+      isArchived: false,
+      isDeleted:  false
+    });
+    console.log(`✓ Found ${allEmployees.length} active employees`);
 
-    // ── Filter to payroll-eligible employees only ──────────────────────────
-    // Skip admin / superadmin — they have no shift or salary data.
-    const payrollEmployees = employees.filter(
-      emp => emp.role === 'employee' && emp.shift?.start && emp.shift?.end && emp.salaryType
+    // ── Filter to payroll-eligible participants ────────────────────────────
+    // Include role 'employee' AND role 'admin' — both have shift + salary.
+    // Exclude 'superadmin' — login-only, no payroll data.
+    const payrollEmployees = allEmployees.filter(
+      emp =>
+        (emp.role === 'employee' || emp.role === 'admin') &&
+        emp.shift?.start &&
+        emp.shift?.end &&
+        emp.salaryType
     );
-    console.log(`  → ${payrollEmployees.length} payroll employees (${employees.length - payrollEmployees.length} system accounts skipped)`);
+
+    const skipped = allEmployees.length - payrollEmployees.length;
+    console.log(`  → ${payrollEmployees.length} payroll participants (${skipped} superadmin account(s) skipped)`);
 
     // ── Date range: last 60 days ───────────────────────────────────────────
     const today = new Date();
@@ -321,7 +330,6 @@ async function seedDemoData() {
     }
 
     // ── Compute payroll + performance per employee per calendar month ──────
-    // Collect unique months covered
     const months = new Set();
     for (let d = new Date(rangeStart); d <= today; d.setMonth(d.getMonth() + 1)) {
       months.add(`${d.getFullYear()}-${d.getMonth()}`);
@@ -343,11 +351,11 @@ async function seedDemoData() {
       const workingDays = countWorkingDays(clampedStart, clampedEnd);
 
       for (const emp of payrollEmployees) {
-        // Fetch this employee's attendance for the clamped period
         const records = attendanceRecords.filter(
-          r => String(r.empId) === String(emp._id) &&
-               r.date >= clampedStart &&
-               r.date <= clampedEnd
+          r =>
+            String(r.empId) === String(emp._id) &&
+            r.date >= clampedStart &&
+            r.date <= clampedEnd
         );
 
         if (records.length === 0) continue;

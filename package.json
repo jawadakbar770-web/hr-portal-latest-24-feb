@@ -22,6 +22,7 @@
   "author": "Jawad Akbar",
   "license": "ISC",
   "devDependencies": {
-    "concurrently": "^7.6.0"
+    "concurrently": "^7.6.0",
+    "nodemon": "^3.1.14"
   }
 }

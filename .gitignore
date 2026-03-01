@@ -21,3 +21,6 @@ dist/
 build/
 coverage/
 .vercel
+package-lock.json
+**/package-lock.json
+yarn.lock
